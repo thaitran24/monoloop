@@ -15,7 +15,7 @@ from layers import *
 
 
 class LoopDecoder(nn.Module):
-    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1, use_skips=True):
+    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=3, use_skips=True):
         super(LoopDecoder, self).__init__()
 
         self.num_output_channels = num_output_channels
@@ -60,6 +60,6 @@ class LoopDecoder(nn.Module):
             x = torch.cat(x, 1)
             x = self.convs[("upconv", i, 1)](x)
             if i in self.scales:
-                self.outputs[("disp", i)] = self.sigmoid(self.convs[("dispconv", i)](x))
+                self.outputs[("loop", i)] = self.sigmoid(self.convs[("dispconv", i)](x))
 
         return self.outputs

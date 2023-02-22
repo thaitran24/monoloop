@@ -25,11 +25,15 @@ import datasets
 import networks
 from IPython import embed
 
+import cv2
+STEREO_SCALE_FACTOR = 5.4
+
 
 class Trainer:
     def __init__(self, options):
         self.opt = options
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
+        self.result_path = os.path.join(self.log_path, 'result.txt')
 
         # checking height and width are multiples of 32
         assert self.opt.height % 32 == 0, "'height' must be a multiple of 32"
@@ -62,7 +66,7 @@ class Trainer:
         self.parameters_to_train += list(self.models["depth"].parameters())
 
         if self.opt.loop_depth:
-            self.models["loop_encoder"] = networks.ResnetEncoder(
+            self.models["loop_encoder"] = networks.LoopEncoder(
                 self.opt.num_layers, self.opt.weights_init == "pretrained")
             self.models["loop_encoder"].to(self.device)
             self.parameters_to_train += list(self.models["loop_encoder"].parameters())
@@ -70,7 +74,9 @@ class Trainer:
             self.models["loop_decoder"] = networks.LoopDecoder(
                 self.models["loop_encoder"].num_ch_enc, self.opt.scales)
             self.models["loop_decoder"].to(self.device)
-            self.parameters_to_train += list(self.models["loop_decoder"].parameters())            
+            self.parameters_to_train += list(self.models["loop_decoder"].parameters())
+
+            self.mse = torch.nn.MSELoss().cuda()    
 
 
         if self.use_pose_net:
@@ -144,9 +150,9 @@ class Trainer:
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
         val_dataset = self.dataset(
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=False, img_ext=img_ext)
+            [0], 4, is_train=False, img_ext='.png')
         self.val_loader = DataLoader(
-            val_dataset, self.opt.batch_size, True,
+            val_dataset, self.opt.batch_size, False,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
         self.val_iter = iter(self.val_loader)
 
@@ -233,9 +239,11 @@ class Trainer:
                     self.compute_depth_losses(inputs, outputs, losses)
 
                 self.log("train", inputs, outputs, losses)
-                self.val()
+                # self.val()
 
             self.step += 1
+
+        self.evaluate()
 
     def process_batch(self, inputs):
         """Pass a minibatch through the network and generate images and losses
@@ -260,8 +268,10 @@ class Trainer:
             features = self.models["encoder"](inputs["color_aug", 0, 0])
             outputs = self.models["depth"](features)
             if self.opt.loop_depth:
-                loop_features = self.models["loop_encoder"](outputs[("disp", 0)])
-                loop_outputs  = self.models["loop_encoder"](loop_features)
+                depth_disp = outputs[("disp", 0)].expand(-1, 3, -1, -1)
+                loop_features = self.models["loop_encoder"](depth_disp)
+                loop_outputs  = self.models["loop_decoder"](loop_features)
+                loop_loss = self.mse(inputs["color", 0, 0], loop_outputs[("loop", 0)])
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
@@ -271,6 +281,10 @@ class Trainer:
 
         self.generate_images_pred(inputs, outputs)
         losses = self.compute_losses(inputs, outputs)
+
+        if self.opt.loop_depth:
+            losses["loop"] = loop_loss
+            losses["loss"] += loop_loss
 
         return outputs, losses
 
@@ -337,10 +351,12 @@ class Trainer:
         """
         self.set_eval()
         try:
-            inputs = self.val_iter.next()
+            # inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
         except StopIteration:
             self.val_iter = iter(self.val_loader)
-            inputs = self.val_iter.next()
+            # inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
 
         with torch.no_grad():
             outputs, losses = self.process_batch(inputs)
@@ -352,6 +368,179 @@ class Trainer:
             del inputs, outputs, losses
 
         self.set_train()
+
+    def evaluate(self):
+        """Evaluates a pretrained model using a specified test set
+        """
+        MIN_DEPTH = 1e-3
+        MAX_DEPTH = 80
+        self.set_eval()
+
+        assert sum((self.opt.eval_mono, self.opt.eval_stereo)) == 1, \
+            "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"
+
+        pred_disps = []
+        gt = []
+
+        print("-> Computing predictions with size {}x{}".format(
+            self.opt.width, self.opt.height))
+
+        dataloader = self.val_loader
+
+        with torch.no_grad():
+            for data in dataloader:
+                input_color = data[("color", 0, 0)].cuda()
+
+                if self.opt.post_process:
+                    # Post-processed results require each image to have two forward passes
+                    input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
+
+                output = self.models["depth"](self.models["encoder"](input_color))
+
+                pred_disp, _ = disp_to_depth(output[("disp", 0)], self.opt.min_depth, self.opt.max_depth)
+                pred_disp = pred_disp.cpu()[:, 0].numpy()
+
+                if self.opt.post_process:
+                    N = pred_disp.shape[0] // 2
+                    pred_disp = self.batch_post_process_disparity(pred_disp[:N], pred_disp[N:, :, ::-1])
+
+                pred_disps.append(pred_disp)
+                gt.append(np.squeeze(data["depth_gt"].cpu().numpy()))
+
+        pred_disps = np.concatenate(pred_disps)
+        if gt[-1].ndim == 2:
+            gt[-1] = gt[-1][np.newaxis, :]
+        gt = np.concatenate(gt)
+
+        if self.opt.save_pred_disps:
+            output_path = os.path.join(
+                self.opt.load_weights_folder, "disps_{}_split.npy".format(opt.eval_split))
+            print("-> Saving predicted disparities to ", output_path)
+            np.save(output_path, pred_disps)
+
+        if self.opt.no_eval:
+            print("-> Evaluation disabled. Done.")
+            quit()
+
+        elif self.opt.eval_split == 'benchmark':
+            save_dir = os.path.join(self.opt.load_weights_folder, "benchmark_predictions")
+            print("-> Saving out benchmark predictions to {}".format(save_dir))
+            if not os.path.exists(save_dir):
+                os.makedirs(save_dir)
+
+            for idx in range(len(pred_disps)):
+                disp_resized = cv2.resize(pred_disps[idx], (1280, 640))
+                depth = STEREO_SCALE_FACTOR / disp_resized
+                depth = np.clip(depth, 0, 80)
+                depth = np.uint16(depth * 256)
+                save_path = os.path.join(save_dir, "{:010d}.png".format(idx))
+                cv2.imwrite(save_path, depth)
+
+            print("-> No ground truth is available for the KITTI benchmark, so not evaluating. Done.")
+            quit()
+
+        # gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
+        # gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
+
+        print("-> Evaluating")
+
+        if self.opt.eval_stereo:
+            print("   Stereo evaluation - "
+                "disabling median scaling, scaling by {}".format(STEREO_SCALE_FACTOR))
+            self.opt.disable_median_scaling = True
+            self.opt.pred_depth_scale_factor = STEREO_SCALE_FACTOR
+        else:
+            print("   Mono evaluation - using median scaling")
+
+        errors = []
+        ratios = []
+
+        for i in range(pred_disps.shape[0]):
+        # for i in range(len(pred_disps)):
+            gt_depth = gt[i]
+            gt_height, gt_width = gt_depth.shape[:2]
+
+            pred_disp = pred_disps[i]
+            pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
+            pred_depth = 1 / pred_disp
+
+            if self.opt.eval_split == "eigen":
+                mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
+
+                crop = np.array([0.40810811 * gt_height, 0.99189189 * gt_height,
+                                0.03594771 * gt_width,  0.96405229 * gt_width]).astype(np.int32)
+                crop_mask = np.zeros(mask.shape)
+                crop_mask[crop[0]:crop[1], crop[2]:crop[3]] = 1
+                mask = np.logical_and(mask, crop_mask)
+
+            else:
+                mask = gt_depth > 0
+
+            pred_depth = pred_depth[mask]
+            gt_depth = gt_depth[mask]
+
+            pred_depth *= self.opt.pred_depth_scale_factor
+            if not self.opt.disable_median_scaling:
+                ratio = np.median(gt_depth) / np.median(pred_depth)
+                ratios.append(ratio)
+                pred_depth *= ratio
+
+            pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
+            pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
+
+            errors.append(self.compute_errors(gt_depth, pred_depth))
+
+        if not self.opt.disable_median_scaling:
+            ratios = np.array(ratios)
+            med = np.median(ratios)
+            print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
+
+        mean_errors = np.array(errors).mean(0)
+
+        print("\n  " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
+        print(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
+        print("\n-> Done!")
+
+        with open(self.result_path, 'a') as f:
+            for i in range(len(mean_errors)):
+                f.write(str(mean_errors[i])) #
+                f.write('\t')
+            f.write("\n")
+
+        f.close()
+
+        self.set_train()
+        return mean_errors
+
+    def batch_post_process_disparity(self, l_disp, r_disp):
+        """Apply the disparity post-processing method as introduced in Monodepthv1
+        """
+        _, h, w = l_disp.shape
+        m_disp = 0.5 * (l_disp + r_disp)
+        l, _ = np.meshgrid(np.linspace(0, 1, w), np.linspace(0, 1, h))
+        l_mask = (1.0 - np.clip(20 * (l - 0.05), 0, 1))[None, ...]
+        r_mask = l_mask[:, :, ::-1]
+        return r_mask * l_disp + l_mask * r_disp + (1.0 - l_mask - r_mask) * m_disp
+
+    def compute_errors(self, gt, pred):
+        """Computation of error metrics between predicted and ground truth depths
+        """
+        thresh = np.maximum((gt / pred), (pred / gt))
+        a1 = (thresh < 1.25).mean()
+        a2 = (thresh < 1.25 ** 2).mean()
+        a3 = (thresh < 1.25 ** 3).mean()
+
+        rmse = (gt - pred) ** 2
+        rmse = np.sqrt(rmse.mean())
+
+        rmse_log = (np.log(gt) - np.log(pred)) ** 2
+        rmse_log = np.sqrt(rmse_log.mean())
+
+        abs_rel = np.mean(np.abs(gt - pred) / gt)
+
+        sq_rel = np.mean(((gt - pred) ** 2) / gt)
+
+        return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
     def generate_images_pred(self, inputs, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
@@ -559,32 +748,32 @@ class Trainer:
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
 
-        for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
-            for s in self.opt.scales:
-                for frame_id in self.opt.frame_ids:
-                    writer.add_image(
-                        "color_{}_{}/{}".format(frame_id, s, j),
-                        inputs[("color", frame_id, s)][j].data, self.step)
-                    if s == 0 and frame_id != 0:
-                        writer.add_image(
-                            "color_pred_{}_{}/{}".format(frame_id, s, j),
-                            outputs[("color", frame_id, s)][j].data, self.step)
+        # for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
+        #     for s in self.opt.scales:
+        #         for frame_id in self.opt.frame_ids:
+        #             writer.add_image(
+        #                 "color_{}_{}/{}".format(frame_id, s, j),
+        #                 inputs[("color", frame_id, s)][j].data, self.step)
+        #             if s == 0 and frame_id != 0:
+        #                 writer.add_image(
+        #                     "color_pred_{}_{}/{}".format(frame_id, s, j),
+        #                     outputs[("color", frame_id, s)][j].data, self.step)
 
-                writer.add_image(
-                    "disp_{}/{}".format(s, j),
-                    normalize_image(outputs[("disp", s)][j]), self.step)
+        #         writer.add_image(
+        #             "disp_{}/{}".format(s, j),
+        #             normalize_image(outputs[("disp", s)][j]), self.step)
 
-                if self.opt.predictive_mask:
-                    for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
-                        writer.add_image(
-                            "predictive_mask_{}_{}/{}".format(frame_id, s, j),
-                            outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
-                            self.step)
+        #         if self.opt.predictive_mask:
+        #             for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
+        #                 writer.add_image(
+        #                     "predictive_mask_{}_{}/{}".format(frame_id, s, j),
+        #                     outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
+        #                     self.step)
 
-                elif not self.opt.disable_automasking:
-                    writer.add_image(
-                        "automask_{}/{}".format(s, j),
-                        outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
+        #         elif not self.opt.disable_automasking:
+        #             writer.add_image(
+        #                 "automask_{}/{}".format(s, j),
+        #                 outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
