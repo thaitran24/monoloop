@@ -62,10 +62,16 @@ class Trainer:
         self.parameters_to_train += list(self.models["depth"].parameters())
 
         if self.opt.loop_depth:
-            self.models["loop"] = networks.LoopDecoder(
-                self.models["encoder"].num_ch_enc, self.opt.scales)
-            self.models["loop"].to(self.device)
-            self.parameters_to_train += list(self.models["loop"].parameters())            
+            self.models["loop_encoder"] = networks.ResnetEncoder(
+                self.opt.num_layers, self.opt.weights_init == "pretrained")
+            self.models["loop_encoder"].to(self.device)
+            self.parameters_to_train += list(self.models["loop_encoder"].parameters())
+
+            self.models["loop_decoder"] = networks.LoopDecoder(
+                self.models["loop_encoder"].num_ch_enc, self.opt.scales)
+            self.models["loop_decoder"].to(self.device)
+            self.parameters_to_train += list(self.models["loop_decoder"].parameters())            
+
 
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
@@ -254,7 +260,8 @@ class Trainer:
             features = self.models["encoder"](inputs["color_aug", 0, 0])
             outputs = self.models["depth"](features)
             if self.opt.loop_depth:
-                loop_features = self.models["loop"](outputs)
+                loop_features = self.models["loop_encoder"](outputs[("disp", 0)])
+                loop_outputs  = self.models["loop_encoder"](loop_features)
 
         if self.opt.predictive_mask:
             outputs["predictive_mask"] = self.models["predictive_mask"](features)
