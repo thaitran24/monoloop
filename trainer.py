@@ -527,6 +527,7 @@ class Trainer:
         """
         MIN_DEPTH = 1e-3
         MAX_DEPTH = 80
+        EVAL_DEPTH = 40
         self.set_eval()
 
         assert sum((self.opt.eval_mono, self.opt.eval_stereo)) == 1, \
@@ -562,13 +563,13 @@ class Trainer:
                     N = pred_disp.shape[0] // 2
                     pred_disp = self.batch_post_process_disparity(pred_disp[:N], pred_disp[N:, :, ::-1])
 
-                pred_disps.append(pred_disp)
-                gt.append(np.squeeze(data["depth_gt"].cpu().numpy()))
+                pred_disps.append(np.squeeze(pred_disp))
+                gt.append(np.squeeze(data['depth_gt'].cpu().numpy()))
 
-        pred_disps = np.concatenate(pred_disps)
-        if gt[-1].ndim == 2:
-            gt[-1] = gt[-1][np.newaxis, :]
-        gt = np.concatenate(gt)
+        # pred_disps = np.concatenate(pred_disps)
+        # if gt[-1].ndim == 2:
+        #     gt[-1] = gt[-1][np.newaxis, :]
+        # gt = np.concatenate(gt)
 
         if self.opt.save_pred_disps:
             output_path = os.path.join(
@@ -596,8 +597,8 @@ class Trainer:
         errors = []
         ratios = []
 
-        for i in range(pred_disps.shape[0]):
-        # for i in range(len(pred_disps)):
+        # for i in range(pred_disps.shape[0]):
+        for i in range(len(pred_disps)):
             gt_depth = gt[i]
             gt_height, gt_width = gt_depth.shape[:2]
 
@@ -628,7 +629,10 @@ class Trainer:
 
             pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
             pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
-
+            
+            mask2 = gt_depth <= EVAL_DEPTH
+            pred_depth = pred_depth[mask2]
+            gt_depth = gt_depth[mask2]
             errors.append(self.compute_errors(gt_depth, pred_depth))
 
         if not self.opt.disable_median_scaling:
