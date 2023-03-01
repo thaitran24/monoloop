@@ -259,6 +259,7 @@ class Trainer:
         """Run a single epoch of training and validation
         """
         self.model_lr_scheduler.step()
+        self.model_lr_scheduler_D.step()
 
         print("Training")
         self.set_train()
@@ -400,6 +401,9 @@ class Trainer:
         losses["p1/outer_sim"] = self.l1_loss(day_outer_outputs_p1[("render", 0)], day_inputs["color", 0, 0])
         losses["p1/depth_sim"] = self.l1_loss(day_depth_outputs_p1[("disp", 0)].detach(),   # Stop gradient when update day depth
                                           night_depth_outputs_p1[("disp", 0)])
+
+        if self.opt.pseudo_guide:
+            losses["p1/depth_sim"] += self.l1_loss(pseudo_outputs[("disp", 0)], day_depth_outputs_p1[("disp", 0)])
 
         if self.use_pose_net:
             day_depth_outputs_p1.update(self.predict_poses(day_inputs, day_features_p1))
