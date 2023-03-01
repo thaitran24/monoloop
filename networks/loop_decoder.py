@@ -60,7 +60,7 @@ class LoopDecoder(nn.Module):
             x = torch.cat(x, 1)
             x = self.convs[("upconv", i, 1)](x)
             if i in self.scales:
-                if not disp_maps:
+                if disp_maps:
                     disp = disp_maps[("disp", i)].expand(-1, disp_maps[("disp", i)].shape[1], -1, -1)
                     x = torch.mul(x, disp)
                 self.outputs[("render", i)] = self.sigmoid(self.convs[("dispconv", i)](x))

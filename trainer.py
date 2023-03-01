@@ -13,10 +13,10 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from tensorboardX import SummaryWriter
 
 import json
-import lpips
 
 from utils import *
 from kitti_utils import *
@@ -70,6 +70,7 @@ class Trainer:
         self.parameters_to_train += list(self.models["depth"].parameters())
 
         if self.opt.load_pseudo_model:
+            self.pseudo_models = {}
             # Pseudo Model Encoder and Decoder
             self.pseudo_models["encoder"] = networks.ResnetEncoder(
                 self.opt.num_layers, self.opt.weights_init == "pretrained")
@@ -97,22 +98,23 @@ class Trainer:
         self.parameters_to_train += list(self.models["night_dec"].parameters())
 
         if self.opt.shared_classifier:
-            self.classifiers["day/night"] = networks.Classifier(num_classes=1)
+            self.classifiers["day/night"] = networks.Classifier(num_channels=3)
             self.classifiers[""].to(self.device)
             self.parameters_to_train_D += list(self.classifiers["night"].parameters())
         else:
             # Night discriminator   
-            self.classifiers["night"] = networks.Classifier(num_classes=1)
+            self.classifiers["night"] = networks.Classifier(num_channels=3)
             self.classifiers["night"].to(self.device)
             self.parameters_to_train_D += list(self.classifiers["night"].parameters())
             
             # Day discriminator
-            self.classifiers["day"] = networks.Classifier(num_classes=1)
+            self.classifiers["day"] = networks.Classifier(num_channels=3)
             self.classifiers["day"].to(self.device)
             self.parameters_to_train_D += list(self.classifiers["day"].parameters())
 
+        self.l1_loss = torch.nn.L1Loss().cuda()
         self.mse = torch.nn.MSELoss().cuda()
-        self.percep = lpips.LPIPS().cuda()
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg').cuda()
     
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
@@ -278,14 +280,15 @@ class Trainer:
 
             for param in self.classifiers["day"].parameters():
                 param.requires_grad = False
-            for param in self.classifiers["day"].parameters():
+            for param in self.classifiers["night"].parameters():
                 param.requires_grad = False
             
             losses["loss"].backward()
+
             for param in self.classifiers["day"].parameters():
-                param.requires_grad = False
-            for param in self.classifiers["day"].parameters():
-                param.requires_grad = False
+                param.requires_grad = True
+            for param in self.classifiers["night"].parameters():
+                param.requires_grad = True
             
             losses["p1/D"].backward()
             losses["p2/D"].backward()
@@ -310,8 +313,8 @@ class Trainer:
 
             self.step += 1
 
-        self.evaluate(day=True)
-        self.evaluate(day=False)
+        # self.evaluate(day=True)
+        # self.evaluate(day=False)
 
     def process_batch(self, day_inputs, night_inputs):
         """Pass a minibatch through the network and generate images and losses
@@ -319,7 +322,7 @@ class Trainer:
         for key, ipt in day_inputs.items():
             day_inputs[key] = ipt.to(self.device)
 
-        for key, ipt in day_inputs.items():
+        for key, ipt in night_inputs.items():
             night_inputs[key] = ipt.to(self.device)
         
         # PHASE 1: Day -> Depth -> Night -> Depth -> Day
@@ -333,12 +336,12 @@ class Trainer:
             pseudo_outputs = self.models["depth"](pseudo_features)
 
         # Fuse disp with pseudo disp
-        fuse_depth_disp = day_depth_outputs_p1.detach()  # Stop Gradient
+        fuse_depth_disp = {}
         if self.opt.load_pseudo_model:
             alpha = 0.5
             for i in self.opt.scales:
                 fuse_depth_disp[("disp", i)] = alpha * pseudo_outputs[("disp", i)] + \
-                    (1 - alpha) * fuse_depth_disp[("disp", i)]
+                    (1 - alpha) * day_depth_outputs_p1[("disp", i)].detach()  # Stop Gradient
 
         # 1.2. Inner Loop: Depth -> Day
         day_inner_outputs_p1  = self.models["day_dec"](day_features_p1, fuse_depth_disp)
@@ -349,12 +352,12 @@ class Trainer:
         # 1.4. Outer Loop: Night -> Depth
         night_features_p1 = self.models["encoder"](night_outer_outputs_p1[("render", 0)])
         night_depth_outputs_p1 = self.models["depth"](night_features_p1)
-        fuse_depth_disp = night_depth_outputs_p1.detach()    # Stop Gradient
+        fuse_depth_disp = {} 
         if self.opt.load_pseudo_model:
             alpha = 0.5
             for i in self.opt.scales:
                 fuse_depth_disp[("disp", i)] = alpha * pseudo_outputs[("disp", i)] + \
-                    (1 - alpha) * fuse_depth_disp[("disp", i)]
+                    (1 - alpha) * night_depth_outputs_p1[("disp", i)].detach()    # Stop Gradient
 
         # 1.5: Outer Loop: Depth -> Day
         day_outer_outputs_p1 = self.models["day_dec"](night_features_p1, fuse_depth_disp)
@@ -382,64 +385,91 @@ class Trainer:
         # LOSS
         losses = {}
         losses["loss"] = 0
+        
+        # Hyper-parameters
+        lambda_inner_sim = 1
+        lambda_outer_sim = 1
+        lambda_depth_sim = 1
+        lambda_feat_sim = 0.1
+        lambda_percep = 0.25
+        lambda_adv = 0.1
+        lambda_depth = 1.25
 
         # Phase 1 losses
-        losses["p1/inner_sim"] = self.mse(day_inner_outputs_p1[("render", 0)], day_inputs["color", 0, 0])
-        losses["p1/outer_sim"] = self.mse(day_outer_outputs_p1[("render", 0)], day_inputs["color", 0, 0])
-        losses["p1/depth_sim"] = self.mse(day_depth_outputs_p1[("disp", 0)].detach(),   # Stop gradient when update day depth
+        losses["p1/inner_sim"] = self.l1_loss(day_inner_outputs_p1[("render", 0)], day_inputs["color", 0, 0])
+        losses["p1/outer_sim"] = self.l1_loss(day_outer_outputs_p1[("render", 0)], day_inputs["color", 0, 0])
+        losses["p1/depth_sim"] = self.l1_loss(day_depth_outputs_p1[("disp", 0)].detach(),   # Stop gradient when update day depth
                                           night_depth_outputs_p1[("disp", 0)])
 
         if self.use_pose_net:
-            # Depth loss only for day
             day_depth_outputs_p1.update(self.predict_poses(day_inputs, day_features_p1))
         
         self.generate_images_pred(day_inputs, day_depth_outputs_p1)
         losses_depth_p1 = self.compute_losses(day_inputs, day_depth_outputs_p1)
         
 
-        losses["p1/depth_day"] = losses_depth_p1["loss"]
-        losses["p1/feat_sim"] = self.mse(day_features_p1[3], night_features_p1[3])
-        losses["p1/img_percep"] = self.percep(day_inputs["color_aug", 0, 0], night_outer_outputs_p1[("render", 0)])
-
+        losses["p1/depth"] = losses_depth_p1["loss"]
+        losses["p1/feat_sim"] = self.l1_loss(day_features_p1[3], night_features_p1[3])
+        losses["p1/percep"] = self.lpips(day_inputs["color_aug", 0, 0], night_outer_outputs_p1[("render", 0)])
+        
         # Phase 1 adversarial
         night_pred = self.classifiers["night"](night_inputs["color", 0, 0])
         night_trans_pred = self.classifiers["night"](night_outer_outputs_p1[("render", 0)])
         source_label = torch.FloatTensor(night_pred.data.size()).fill_(0).to(self.device)
         target_label = torch.FloatTensor(night_pred.data.size()).fill_(1).to(self.device)
-        losses["p1/G"] = self.mse(night_pred, source_label) + self.mse(night_trans_pred, source_label)
-        losses["p1/D"] = self.mse(night_pred.detach(), target_label) + self.mse(night_trans_pred.detach(), target_label)
-
-        losses["loss"] += losses["p1/inner_sim"] + losses["p1/outer_sim"] + losses["p1/depth_sim"] + \
-            losses["p1/depth_day"] + losses["p1/feat_sim"] + losses["p1/img_percep"] + losses["p1/G"]
+        losses["p1/G"] = self.mse(night_pred, source_label) + self.mse(night_trans_pred, target_label)
         
-
+        night_pred = self.classifiers["night"](night_inputs["color", 0, 0].detach())
+        night_trans_pred = self.classifiers["night"](night_outer_outputs_p1[("render", 0)].detach())
+        losses["p1/D"] = self.mse(night_pred, target_label) + self.mse(night_trans_pred, source_label)
+        
+        losses["p1/inner_sim"] *= lambda_inner_sim
+        losses["p1/outer_sim"] *= lambda_outer_sim
+        losses["p1/depth_sim"] *= lambda_depth_sim
+        losses["p1/depth"] *= lambda_depth
+        losses["p1/feat_sim"] *= lambda_feat_sim
+        losses["p1/percep"] *= lambda_percep
+        losses["p1/G"] *= lambda_adv
+        
+        losses["loss"] += losses["p1/inner_sim"] + losses["p1/outer_sim"] + losses["p1/depth_sim"] + \
+            losses["p1/depth"] + losses["p1/feat_sim"] + losses["p1/percep"] + losses["p1/G"]
+        
         # Phase 2 losses
-        losses["p2/inner_sim"] = self.mse(night_inner_outputs_p2[("render", 0)], night_inputs["color", 0, 0])
-        losses["p2/outer_sim"] = self.mse(night_outer_outputs_p2[("render", 0)], night_inputs["color", 0, 0])
-        losses["p2/depth_sim"] = self.mse(night_depth_outputs_p2[("disp", 0)], day_depth_outputs_p2[("disp", 0)])
+        losses["p2/inner_sim"] = self.l1_loss(night_inner_outputs_p2[("render", 0)], night_inputs["color", 0, 0])
+        losses["p2/outer_sim"] = self.l1_loss(night_outer_outputs_p2[("render", 0)], night_inputs["color", 0, 0])
+        losses["p2/depth_sim"] = self.l1_loss(night_depth_outputs_p2[("disp", 0)], day_depth_outputs_p2[("disp", 0)])
 
         if self.use_pose_net:
-            # Depth loss only for night
             night_depth_outputs_p2.update(self.predict_poses(night_inputs, night_features_p2))
         self.generate_images_pred(night_inputs, night_depth_outputs_p2)
         losses_depth_p2 = self.compute_losses(night_inputs, night_depth_outputs_p2)
 
-        losses["p2/depth_night"] = losses_depth_p2["loss"]
-        losses["p2/feat_sim"] = self.mse(day_features_p2[3], night_features_p2[3])
-        losses["p1/img_percep"] = self.percep(night_inputs["color_aug", 0, 0], day_outer_outputs_p2[("render", 0)])
+        losses["p2/depth"] = losses_depth_p2["loss"]
+        losses["p2/feat_sim"] = self.l1_loss(day_features_p2[3], night_features_p2[3])
+        losses["p2/percep"] = self.lpips(night_inputs["color_aug", 0, 0], day_outer_outputs_p2[("render", 0)])
 
         # Phase 2 adversarial
         day_pred = self.classifiers["day"](day_inputs["color", 0, 0])
         day_trans_pred = self.classifiers["day"](day_outer_outputs_p2[("render", 0)])
-        source_label = torch.FloatTensor(day_pred.data.size()).fill_(0).to(self.device)
-        target_label = torch.FloatTensor(day_pred.data.size()).fill_(1).to(self.device)
-        losses["p2/G"] = self.mse(day_pred, source_label) + self.mse(day_trans_pred, source_label)
-        losses["p2/D"] = self.mse(day_pred.detach(), target_label) + self.mse(day_trans_pred.detach(), target_label)
+        losses["p2/G"] = self.mse(day_pred, source_label) + self.mse(day_trans_pred, target_label)
+
+        day_pred = self.classifiers["day"](day_inputs["color", 0, 0].detach())
+        day_trans_pred = self.classifiers["day"](day_outer_outputs_p2[("render", 0)].detach())
+        losses["p2/D"] = self.mse(day_pred, target_label) + self.mse(day_trans_pred, source_label)
+                
+        losses["p2/inner_sim"] *= lambda_inner_sim
+        losses["p2/outer_sim"] *= lambda_outer_sim
+        losses["p2/depth_sim"] *= lambda_depth_sim
+        losses["p2/depth"] *= lambda_depth
+        losses["p2/feat_sim"] *= lambda_feat_sim
+        losses["p2/percep"] *= lambda_percep
+        losses["p2/G"] *= lambda_adv
 
         losses["loss"] += losses["p2/inner_sim"] + losses["p2/outer_sim"] + losses["p2/depth_sim"] + \
-            losses["p2/depth_night"] + losses["p2/feat_sim"] + losses["p2/img_percep"] + losses["p2/G"]
+            losses["p2/depth"] + losses["p2/feat_sim"] + losses["p2/percep"] + losses["p2/G"]
 
         return losses
+
 
     def predict_poses(self, inputs, features):
         """Predict poses between input frames for monocular sequences.
@@ -563,13 +593,13 @@ class Trainer:
                     N = pred_disp.shape[0] // 2
                     pred_disp = self.batch_post_process_disparity(pred_disp[:N], pred_disp[N:, :, ::-1])
 
-                pred_disps.append(np.squeeze(pred_disp))
+                pred_disps.append(pred_disp)
                 gt.append(np.squeeze(data['depth_gt'].cpu().numpy()))
 
-        # pred_disps = np.concatenate(pred_disps)
-        # if gt[-1].ndim == 2:
-        #     gt[-1] = gt[-1][np.newaxis, :]
-        # gt = np.concatenate(gt)
+        pred_disps = np.concatenate(pred_disps)
+        if gt[-1].ndim == 2:
+            gt[-1] = gt[-1][np.newaxis, :]
+        gt = np.concatenate(gt)
 
         if self.opt.save_pred_disps:
             output_path = os.path.join(
@@ -581,7 +611,7 @@ class Trainer:
             print("-> Evaluation disabled. Done.")
             quit()
 
-        # gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
+        # gt_path = os.path.join(self.opt.split, eval_split, "gt_depths.npz")
         # gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
 
         print("-> Evaluating")
@@ -597,8 +627,8 @@ class Trainer:
         errors = []
         ratios = []
 
-        # for i in range(pred_disps.shape[0]):
-        for i in range(len(pred_disps)):
+        for i in range(pred_disps.shape[0]):
+        # for i in range(len(pred_disps)):
             gt_depth = gt[i]
             gt_height, gt_width = gt_depth.shape[:2]
 
@@ -869,14 +899,21 @@ class Trainer:
             self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
         print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
             " | loss: {:.5f} | loss day: {:.5f} | loss night: {:.5f}" + \
-                " | loss D: {:.5f} | loss G: {:.5f} |  time elapsed: {} | time left: {}"
+                " | loss D: {:.5f} | loss G: {:.5f} | loss inner: {:.5f}" + \
+                    " | loss outer: {:.5f} | loss depth: {:.5f} | loss feat: {:.5f}" + \
+                        " | loss percep: {:.5f} |  time elapsed: {} | time left: {}"
         print(print_string.format(self.epoch, batch_idx, samples_per_sec, losses["loss"].cpu().data, \
-                                  losses["p1/depth_day"].cpu().data, losses["p2/depth_night"].cpu().data, \
+                                  losses["p1/depth"].cpu().data, losses["p2/depth"].cpu().data, \
                                   losses["p1/D"].cpu().data + losses["p2/D"].cpu().data, \
                                   losses["p1/G"].cpu().data + losses["p2/G"].cpu().data, \
+                                  losses["p1/inner_sim"].cpu().data + losses["p2/inner_sim"].cpu().data, \
+                                  losses["p1/outer_sim"].cpu().data + losses["p2/outer_sim"].cpu().data, \
+                                  losses["p1/depth_sim"].cpu().data + losses["p2/depth_sim"].cpu().data, \
+                                  losses["p1/feat_sim"].cpu().data + losses["p2/feat_sim"].cpu().data, \
+                                  losses["p1/percep"].cpu().data + losses["p2/percep"].cpu().data, \
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
-    def log(self, mode, inputs, outputs, losses):
+    def log(self, mode, losses):
         """Write an event to the tensorboard events file
         """
         writer = self.writers[mode]
