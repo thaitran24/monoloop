@@ -47,7 +47,7 @@ class LoopDecoder(nn.Module):
         self.decoder = nn.ModuleList(list(self.convs.values()))
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, input_features):
+    def forward(self, input_features, disp_maps=None):
         self.outputs = {}
 
         # decoder
@@ -60,6 +60,9 @@ class LoopDecoder(nn.Module):
             x = torch.cat(x, 1)
             x = self.convs[("upconv", i, 1)](x)
             if i in self.scales:
-                self.outputs[("loop", i)] = self.sigmoid(self.convs[("dispconv", i)](x))
+                if not disp_maps:
+                    disp = disp_maps[("disp", i)].expand(-1, disp_maps[("disp", i)].shape[1], -1, -1)
+                    x = torch.mul(x, disp)
+                self.outputs[("render", i)] = self.sigmoid(self.convs[("dispconv", i)](x))
 
         return self.outputs

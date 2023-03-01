@@ -74,11 +74,11 @@ class MonodepthOptions:
                                  type=float,
                                  help="maximum depth",
                                  default=100.0)
+        self.parser.add_argument("--shared_classifier",
+                                 help="if set, use only a classifier for day/night disc",
+                                 action="store_true")
         self.parser.add_argument("--use_stereo",
                                  help="if set, uses stereo pair for training",
-                                 action="store_true")
-        self.parser.add_argument("--loop_depth",
-                                 help="map depth back to original image",
                                  action="store_true")
         self.parser.add_argument("--frame_ids",
                                  nargs="+",
@@ -149,6 +149,9 @@ class MonodepthOptions:
         self.parser.add_argument("--load_weights_folder",
                                  type=str,
                                  help="name of model to load")
+        self.parser.add_argument("--load_pseudo_model",
+                                 type=str,
+                                 help="name of pseudo model to load")
         self.parser.add_argument("--models_to_load",
                                  nargs="+",
                                  type=str,

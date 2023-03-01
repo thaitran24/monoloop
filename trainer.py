@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
 import json
+import lpips
 
 from utils import *
 from kitti_utils import *
@@ -40,7 +41,9 @@ class Trainer:
         assert self.opt.width % 32 == 0, "'width' must be a multiple of 32"
 
         self.models = {}
+        self.classifiers = {}
         self.parameters_to_train = []
+        self.parameters_to_train_D = []
 
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
@@ -55,6 +58,7 @@ class Trainer:
         if self.opt.use_stereo:
             self.opt.frame_ids.append("s")
 
+        # Shared Depth Encoder and Decoder
         self.models["encoder"] = networks.ResnetEncoder(
             self.opt.num_layers, self.opt.weights_init == "pretrained")
         self.models["encoder"].to(self.device)
@@ -65,20 +69,51 @@ class Trainer:
         self.models["depth"].to(self.device)
         self.parameters_to_train += list(self.models["depth"].parameters())
 
-        if self.opt.loop_depth:
-            self.models["loop_encoder"] = networks.LoopEncoder(
+        if self.opt.load_pseudo_model:
+            # Pseudo Model Encoder and Decoder
+            self.pseudo_models["encoder"] = networks.ResnetEncoder(
                 self.opt.num_layers, self.opt.weights_init == "pretrained")
-            self.models["loop_encoder"].to(self.device)
-            self.parameters_to_train += list(self.models["loop_encoder"].parameters())
+            self.pseudo_models["encoder"].to(self.device)
 
-            self.models["loop_decoder"] = networks.LoopDecoder(
-                self.models["loop_encoder"].num_ch_enc, self.opt.scales)
-            self.models["loop_decoder"].to(self.device)
-            self.parameters_to_train += list(self.models["loop_decoder"].parameters())
+            self.pseudo_models["depth"] = networks.DepthDecoder(
+                self.pseudo_models["encoder"].num_ch_enc, self.opt.scales)
+            self.pseudo_models["depth"].to(self.device)
 
-            self.mse = torch.nn.MSELoss().cuda()    
+            self.load_pseudo_model()
 
+            for m in self.pseudo_models.values():
+                m.eval()
 
+        # Depth to day decoder
+        self.models["day_dec"] = networks.LoopDecoder(
+            self.models["depth"].num_ch_enc, self.opt.scales)
+        self.models["day_dec"].to(self.device)
+        self.parameters_to_train += list(self.models["day_dec"].parameters())
+        
+        # Depth to night decoder
+        self.models["night_dec"] = networks.LoopDecoder(
+            self.models["depth"].num_ch_enc, self.opt.scales)
+        self.models["night_dec"].to(self.device)
+        self.parameters_to_train += list(self.models["night_dec"].parameters())
+
+        if self.opt.shared_classifier:
+            self.classifiers["day/night"] = networks.Classifier(num_classes=1)
+            self.classifiers[""].to(self.device)
+            self.parameters_to_train_D += list(self.classifiers["night"].parameters())
+        else:
+            # Night discriminator   
+            self.classifiers["night"] = networks.Classifier(num_classes=1)
+            self.classifiers["night"].to(self.device)
+            self.parameters_to_train_D += list(self.classifiers["night"].parameters())
+            
+            # Day discriminator
+            self.classifiers["day"] = networks.Classifier(num_classes=1)
+            self.classifiers["day"].to(self.device)
+            self.parameters_to_train_D += list(self.classifiers["day"].parameters())
+
+        self.mse = torch.nn.MSELoss().cuda()
+        self.percep = lpips.LPIPS().cuda()
+    
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
                 self.models["pose_encoder"] = networks.ResnetEncoder(
@@ -105,20 +140,12 @@ class Trainer:
             self.models["pose"].to(self.device)
             self.parameters_to_train += list(self.models["pose"].parameters())
 
-        if self.opt.predictive_mask:
-            assert self.opt.disable_automasking, \
-                "When using predictive_mask, please disable automasking with --disable_automasking"
-
-            # Our implementation of the predictive masking baseline has the the same architecture
-            # as our depth decoder. We predict a separate mask for each source frame.
-            self.models["predictive_mask"] = networks.DepthDecoder(
-                self.models["encoder"].num_ch_enc, self.opt.scales,
-                num_output_channels=(len(self.opt.frame_ids) - 1))
-            self.models["predictive_mask"].to(self.device)
-            self.parameters_to_train += list(self.models["predictive_mask"].parameters())
-
         self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
+            self.model_optimizer, self.opt.scheduler_step_size, 0.1)
+        
+        self.model_optimizer_D = optim.Adam(self.parameters_to_train_D, self.opt.learning_rate)
+        self.model_lr_scheduler_D = optim.lr_scheduler.StepLR(
             self.model_optimizer, self.opt.scheduler_step_size, 0.1)
 
         if self.opt.load_weights_folder is not None:
@@ -128,33 +155,51 @@ class Trainer:
         print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
         print("Training is using:\n  ", self.device)
 
-        # data
-        datasets_dict = {"kitti": datasets.KITTIRAWDataset,
-                         "kitti_odom": datasets.KITTIOdomDataset}
+        # Data
+        datasets_dict = {"kitti": datasets.KITTIRAWDataset}
         self.dataset = datasets_dict[self.opt.dataset]
 
         fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
 
-        train_filenames = readlines(fpath.format("train"))
-        val_filenames = readlines(fpath.format("val"))
+        train_day_filenames = readlines(fpath.format("train_day"))
+        val_day_filenames = readlines(fpath.format("val_day"))
+        train_night_filenames = readlines(fpath.format("train_night"))
+        val_night_filenames = readlines(fpath.format("val_night"))
         img_ext = '.png' if self.opt.png else '.jpg'
 
-        num_train_samples = len(train_filenames)
+        num_train_samples = len(train_day_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
 
-        train_dataset = self.dataset(
-            self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
+        train_day_dataset = self.dataset(
+            self.opt.data_path, train_day_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
-        self.train_loader = DataLoader(
-            train_dataset, self.opt.batch_size, True,
+        self.train_day_loader = DataLoader(
+            train_day_dataset, self.opt.batch_size, True,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
-        val_dataset = self.dataset(
-            self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
+        
+        train_night_dataset = self.dataset(
+            self.opt.data_path, train_night_filenames, self.opt.height, self.opt.width,
+            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+        self.train_night_loader = DataLoader(
+            train_night_dataset, self.opt.batch_size, True,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+
+        val_day_dataset = self.dataset(
+            self.opt.data_path, val_day_filenames, self.opt.height, self.opt.width,
             [0], 4, is_train=False, img_ext='.png')
-        self.val_loader = DataLoader(
-            val_dataset, self.opt.batch_size, False,
+        self.val_day_loader = DataLoader(
+            val_day_dataset, self.opt.batch_size, False,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
-        self.val_iter = iter(self.val_loader)
+        
+        val_night_dataset = self.dataset(
+            self.opt.data_path, val_night_filenames, self.opt.height, self.opt.width,
+            [0], 4, is_train=False, img_ext='.png')
+        self.val_night_loader = DataLoader(
+            val_night_dataset, self.opt.batch_size, False,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+        
+        self.val_day_iter = iter(self.val_day_loader)
+        self.val_night_iter = iter(self.val_night_loader)
 
         self.writers = {}
         for mode in ["train", "val"]:
@@ -181,7 +226,7 @@ class Trainer:
 
         print("Using split:\n  ", self.opt.split)
         print("There are {:d} training items and {:d} validation items\n".format(
-            len(train_dataset), len(val_dataset)))
+            len(train_day_dataset), len(val_day_dataset)))
 
         self.save_opts()
 
@@ -216,15 +261,37 @@ class Trainer:
         print("Training")
         self.set_train()
 
-        for batch_idx, inputs in enumerate(self.train_loader):
+        night_iterator = iter(self.train_night_loader)
+        for batch_idx, day_inputs in enumerate(self.train_day_loader):
+            try:
+                night_inputs = next(night_iterator)
+            except StopIteration:
+                night_iterator = iter(self.train_night_loader)
+                night_inputs = next(night_iterator)
 
             before_op_time = time.time()
 
-            outputs, losses = self.process_batch(inputs)
+            losses = self.process_batch(day_inputs, night_inputs)
 
             self.model_optimizer.zero_grad()
+            self.model_optimizer_D.zero_grad()
+
+            for param in self.classifiers["day"].parameters():
+                param.requires_grad = False
+            for param in self.classifiers["day"].parameters():
+                param.requires_grad = False
+            
             losses["loss"].backward()
+            for param in self.classifiers["day"].parameters():
+                param.requires_grad = False
+            for param in self.classifiers["day"].parameters():
+                param.requires_grad = False
+            
+            losses["p1/D"].backward()
+            losses["p2/D"].backward()
+
             self.model_optimizer.step()
+            self.model_optimizer_D.step()
 
             duration = time.time() - before_op_time
 
@@ -233,60 +300,146 @@ class Trainer:
             late_phase = self.step % 2000 == 0
 
             if early_phase or late_phase:
-                self.log_time(batch_idx, duration, losses["loss"].cpu().data, losses["loop"].cpu().data)
+                self.log_time(batch_idx, duration, losses)
 
-                if "depth_gt" in inputs:
-                    self.compute_depth_losses(inputs, outputs, losses)
+                # if "depth_gt" in day_inputs:
+                #     self.compute_depth_losses(day_inputs, outputs, losses)
 
-                self.log("train", inputs, outputs, losses)
+                self.log("train", losses)
                 # self.val()
 
             self.step += 1
 
-        self.evaluate()
+        self.evaluate(day=True)
+        self.evaluate(day=False)
 
-    def process_batch(self, inputs):
+    def process_batch(self, day_inputs, night_inputs):
         """Pass a minibatch through the network and generate images and losses
         """
-        for key, ipt in inputs.items():
-            inputs[key] = ipt.to(self.device)
+        for key, ipt in day_inputs.items():
+            day_inputs[key] = ipt.to(self.device)
 
-        if self.opt.pose_model_type == "shared":
-            # If we are using a shared encoder for both depth and pose (as advocated
-            # in monodepthv1), then all images are fed separately through the depth encoder.
-            all_color_aug = torch.cat([inputs[("color_aug", i, 0)] for i in self.opt.frame_ids])
-            all_features = self.models["encoder"](all_color_aug)
-            all_features = [torch.split(f, self.opt.batch_size) for f in all_features]
+        for key, ipt in day_inputs.items():
+            night_inputs[key] = ipt.to(self.device)
+        
+        # PHASE 1: Day -> Depth -> Night -> Depth -> Day
+        # 1.1. Day -> Depth
+        day_features_p1 = self.models["encoder"](day_inputs["color_aug", 0, 0])
+        day_depth_outputs_p1 = self.models["depth"](day_features_p1)
 
-            features = {}
-            for i, k in enumerate(self.opt.frame_ids):
-                features[k] = [f[i] for f in all_features]
+        if self.opt.load_pseudo_model:
+            # Day disp pseudo label
+            pseudo_features = self.models["encoder"](day_inputs["color_aug", 0, 0])
+            pseudo_outputs = self.models["depth"](pseudo_features)
 
-            outputs = self.models["depth"](features[0])
-        else:
-            # Otherwise, we only feed the image with frame_id 0 through the depth encoder
-            features = self.models["encoder"](inputs["color_aug", 0, 0])
-            outputs = self.models["depth"](features)
-            if self.opt.loop_depth:
-                depth_disp = outputs[("disp", 0)].expand(-1, 3, -1, -1)
-                loop_features = self.models["loop_encoder"](depth_disp)
-                loop_outputs  = self.models["loop_decoder"](loop_features)
-                loop_loss = self.mse(inputs["color", 0, 0], loop_outputs[("loop", 0)])
+        # Fuse disp with pseudo disp
+        fuse_depth_disp = day_depth_outputs_p1.detach()  # Stop Gradient
+        if self.opt.load_pseudo_model:
+            alpha = 0.5
+            for i in self.opt.scales:
+                fuse_depth_disp[("disp", i)] = alpha * pseudo_outputs[("disp", i)] + \
+                    (1 - alpha) * fuse_depth_disp[("disp", i)]
 
-        if self.opt.predictive_mask:
-            outputs["predictive_mask"] = self.models["predictive_mask"](features)
+        # 1.2. Inner Loop: Depth -> Day
+        day_inner_outputs_p1  = self.models["day_dec"](day_features_p1, fuse_depth_disp)
+
+        # 1.3. Outer Loop: Depth -> Night
+        night_outer_outputs_p1 = self.models["night_dec"](day_features_p1, fuse_depth_disp)
+
+        # 1.4. Outer Loop: Night -> Depth
+        night_features_p1 = self.models["encoder"](night_outer_outputs_p1[("render", 0)])
+        night_depth_outputs_p1 = self.models["depth"](night_features_p1)
+        fuse_depth_disp = night_depth_outputs_p1.detach()    # Stop Gradient
+        if self.opt.load_pseudo_model:
+            alpha = 0.5
+            for i in self.opt.scales:
+                fuse_depth_disp[("disp", i)] = alpha * pseudo_outputs[("disp", i)] + \
+                    (1 - alpha) * fuse_depth_disp[("disp", i)]
+
+        # 1.5: Outer Loop: Depth -> Day
+        day_outer_outputs_p1 = self.models["day_dec"](night_features_p1, fuse_depth_disp)
+
+
+        # PHASE 2: Night -> Depth -> Day -> Depth -> Night
+        # 2.1. Night -> Depth
+        night_features_p2 = self.models["encoder"](night_inputs["color_aug", 0, 0])
+        night_depth_outputs_p2 = self.models["depth"](night_features_p2)
+
+        # 2.2. Inner Loop: Depth -> Night
+        night_inner_outputs_p2 = self.models["night_dec"](night_features_p2, night_depth_outputs_p2)
+
+        # 2.3. Outer Loop: Depth -> Day
+        day_outer_outputs_p2 = self.models["day_dec"](night_features_p2, night_depth_outputs_p2)
+
+        # 2.4. Outer Loop: Day -> Depth
+        day_features_p2 = self.models["encoder"](day_outer_outputs_p2[("render", 0)])
+        day_depth_outputs_p2 = self.models["depth"](day_features_p2)
+        
+        # 2.5. Outer Loop: Depth -> Night
+        night_outer_outputs_p2 = self.models["night_dec"](day_features_p2, day_depth_outputs_p2)
+
+
+        # LOSS
+        losses = {}
+        losses["loss"] = 0
+
+        # Phase 1 losses
+        losses["p1/inner_sim"] = self.mse(day_inner_outputs_p1[("render", 0)], day_inputs["color", 0, 0])
+        losses["p1/outer_sim"] = self.mse(day_outer_outputs_p1[("render", 0)], day_inputs["color", 0, 0])
+        losses["p1/depth_sim"] = self.mse(day_depth_outputs_p1[("disp", 0)].detach(),   # Stop gradient when update day depth
+                                          night_depth_outputs_p1[("disp", 0)])
 
         if self.use_pose_net:
-            outputs.update(self.predict_poses(inputs, features))
+            # Depth loss only for day
+            day_depth_outputs_p1.update(self.predict_poses(day_inputs, day_features_p1))
+        
+        self.generate_images_pred(day_inputs, day_depth_outputs_p1)
+        losses_depth_p1 = self.compute_losses(day_inputs, day_depth_outputs_p1)
+        
 
-        self.generate_images_pred(inputs, outputs)
-        losses = self.compute_losses(inputs, outputs)
+        losses["p1/depth_day"] = losses_depth_p1["loss"]
+        losses["p1/feat_sim"] = self.mse(day_features_p1[3], night_features_p1[3])
+        losses["p1/img_percep"] = self.percep(day_inputs["color_aug", 0, 0], night_outer_outputs_p1[("render", 0)])
 
-        if self.opt.loop_depth:
-            losses["loop"] = loop_loss
-            losses["loss"] += loop_loss
+        # Phase 1 adversarial
+        night_pred = self.classifiers["night"](night_inputs["color", 0, 0])
+        night_trans_pred = self.classifiers["night"](night_outer_outputs_p1[("render", 0)])
+        source_label = torch.FloatTensor(night_pred.data.size()).fill_(0).to(self.device)
+        target_label = torch.FloatTensor(night_pred.data.size()).fill_(1).to(self.device)
+        losses["p1/G"] = self.mse(night_pred, source_label) + self.mse(night_trans_pred, source_label)
+        losses["p1/D"] = self.mse(night_pred.detach(), target_label) + self.mse(night_trans_pred.detach(), target_label)
 
-        return outputs, losses
+        losses["loss"] += losses["p1/inner_sim"] + losses["p1/outer_sim"] + losses["p1/depth_sim"] + \
+            losses["p1/depth_day"] + losses["p1/feat_sim"] + losses["p1/img_percep"] + losses["p1/G"]
+        
+
+        # Phase 2 losses
+        losses["p2/inner_sim"] = self.mse(night_inner_outputs_p2[("render", 0)], night_inputs["color", 0, 0])
+        losses["p2/outer_sim"] = self.mse(night_outer_outputs_p2[("render", 0)], night_inputs["color", 0, 0])
+        losses["p2/depth_sim"] = self.mse(night_depth_outputs_p2[("disp", 0)], day_depth_outputs_p2[("disp", 0)])
+
+        if self.use_pose_net:
+            # Depth loss only for night
+            night_depth_outputs_p2.update(self.predict_poses(night_inputs, night_features_p2))
+        self.generate_images_pred(night_inputs, night_depth_outputs_p2)
+        losses_depth_p2 = self.compute_losses(night_inputs, night_depth_outputs_p2)
+
+        losses["p2/depth_night"] = losses_depth_p2["loss"]
+        losses["p2/feat_sim"] = self.mse(day_features_p2[3], night_features_p2[3])
+        losses["p1/img_percep"] = self.percep(night_inputs["color_aug", 0, 0], day_outer_outputs_p2[("render", 0)])
+
+        # Phase 2 adversarial
+        day_pred = self.classifiers["day"](day_inputs["color", 0, 0])
+        day_trans_pred = self.classifiers["day"](day_outer_outputs_p2[("render", 0)])
+        source_label = torch.FloatTensor(day_pred.data.size()).fill_(0).to(self.device)
+        target_label = torch.FloatTensor(day_pred.data.size()).fill_(1).to(self.device)
+        losses["p2/G"] = self.mse(day_pred, source_label) + self.mse(day_trans_pred, source_label)
+        losses["p2/D"] = self.mse(day_pred.detach(), target_label) + self.mse(day_trans_pred.detach(), target_label)
+
+        losses["loss"] += losses["p2/inner_sim"] + losses["p2/outer_sim"] + losses["p2/depth_sim"] + \
+            losses["p2/depth_night"] + losses["p2/feat_sim"] + losses["p2/img_percep"] + losses["p2/G"]
+
+        return losses
 
     def predict_poses(self, inputs, features):
         """Predict poses between input frames for monocular sequences.
@@ -352,11 +505,11 @@ class Trainer:
         self.set_eval()
         try:
             # inputs = self.val_iter.next()
-            inputs = next(self.val_iter)
+            inputs = next(self.val_day_iter)
         except StopIteration:
-            self.val_iter = iter(self.val_loader)
+            self.val_day_iter = iter(self.val_day_loader)
             # inputs = self.val_iter.next()
-            inputs = next(self.val_iter)
+            inputs = next(self.val_day_iter)
 
         with torch.no_grad():
             outputs, losses = self.process_batch(inputs)
@@ -369,7 +522,7 @@ class Trainer:
 
         self.set_train()
 
-    def evaluate(self):
+    def evaluate(self, day=True):
         """Evaluates a pretrained model using a specified test set
         """
         MIN_DEPTH = 1e-3
@@ -385,7 +538,12 @@ class Trainer:
         print("-> Computing predictions with size {}x{}".format(
             self.opt.width, self.opt.height))
 
-        dataloader = self.val_loader
+        if day:
+            dataloader = self.val_day_loader
+            eval_split = 'val_day'
+        else:
+            dataloader = self.val_night_loader
+            eval_split = 'val_night'
 
         with torch.no_grad():
             for data in dataloader:
@@ -414,29 +572,12 @@ class Trainer:
 
         if self.opt.save_pred_disps:
             output_path = os.path.join(
-                self.opt.load_weights_folder, "disps_{}_split.npy".format(opt.eval_split))
+                self.opt.load_weights_folder, "disps_{}_split.npy".format(eval_split))
             print("-> Saving predicted disparities to ", output_path)
             np.save(output_path, pred_disps)
 
         if self.opt.no_eval:
             print("-> Evaluation disabled. Done.")
-            quit()
-
-        elif self.opt.eval_split == 'benchmark':
-            save_dir = os.path.join(self.opt.load_weights_folder, "benchmark_predictions")
-            print("-> Saving out benchmark predictions to {}".format(save_dir))
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-
-            for idx in range(len(pred_disps)):
-                disp_resized = cv2.resize(pred_disps[idx], (1280, 640))
-                depth = STEREO_SCALE_FACTOR / disp_resized
-                depth = np.clip(depth, 0, 80)
-                depth = np.uint16(depth * 256)
-                save_path = os.path.join(save_dir, "{:010d}.png".format(idx))
-                cv2.imwrite(save_path, depth)
-
-            print("-> No ground truth is available for the KITTI benchmark, so not evaluating. Done.")
             quit()
 
         # gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
@@ -648,20 +789,6 @@ class Trainer:
                     # save both images, and do min all at once below
                     identity_reprojection_loss = identity_reprojection_losses
 
-            elif self.opt.predictive_mask:
-                # use the predicted mask
-                mask = outputs["predictive_mask"]["disp", scale]
-                if not self.opt.v1_multiscale:
-                    mask = F.interpolate(
-                        mask, [self.opt.height, self.opt.width],
-                        mode="bilinear", align_corners=False)
-
-                reprojection_losses *= mask
-
-                # add a loss pushing mask to 1 (using nn.BCELoss for stability)
-                weighting_loss = 0.2 * nn.BCELoss()(mask, torch.ones(mask.shape).cuda())
-                loss += weighting_loss.mean()
-
             if self.opt.avg_reprojection:
                 reprojection_loss = reprojection_losses.mean(1, keepdim=True)
             else:
@@ -729,7 +856,7 @@ class Trainer:
         for i, metric in enumerate(self.depth_metric_names):
             losses[metric] = np.array(depth_errors[i].cpu())
 
-    def log_time(self, batch_idx, duration, loss, loss_loop):
+    def log_time(self, batch_idx, duration, losses):
         """Print a logging statement to the terminal
         """
         samples_per_sec = self.opt.batch_size / duration
@@ -737,8 +864,12 @@ class Trainer:
         training_time_left = (
             self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
         print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
-            " | loss: {:.5f} | loss_loop: {:.5f} | time elapsed: {} | time left: {}"
-        print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss, loss_loop,
+            " | loss: {:.5f} | loss day: {:.5f} | loss night: {:.5f}" + \
+                " | loss D: {:.5f} | loss G: {:.5f} |  time elapsed: {} | time left: {}"
+        print(print_string.format(self.epoch, batch_idx, samples_per_sec, losses["loss"].cpu().data, \
+                                  losses["p1/depth_day"].cpu().data, losses["p2/depth_night"].cpu().data, \
+                                  losses["p1/D"].cpu().data + losses["p2/D"].cpu().data, \
+                                  losses["p1/G"].cpu().data + losses["p2/G"].cpu().data, \
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
     def log(self, mode, inputs, outputs, losses):
@@ -747,33 +878,6 @@ class Trainer:
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
-
-        # for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
-        #     for s in self.opt.scales:
-        #         for frame_id in self.opt.frame_ids:
-        #             writer.add_image(
-        #                 "color_{}_{}/{}".format(frame_id, s, j),
-        #                 inputs[("color", frame_id, s)][j].data, self.step)
-        #             if s == 0 and frame_id != 0:
-        #                 writer.add_image(
-        #                     "color_pred_{}_{}/{}".format(frame_id, s, j),
-        #                     outputs[("color", frame_id, s)][j].data, self.step)
-
-        #         writer.add_image(
-        #             "disp_{}/{}".format(s, j),
-        #             normalize_image(outputs[("disp", s)][j]), self.step)
-
-        #         if self.opt.predictive_mask:
-        #             for f_idx, frame_id in enumerate(self.opt.frame_ids[1:]):
-        #                 writer.add_image(
-        #                     "predictive_mask_{}_{}/{}".format(frame_id, s, j),
-        #                     outputs["predictive_mask"][("disp", s)][j, f_idx][None, ...],
-        #                     self.step)
-
-        #         elif not self.opt.disable_automasking:
-        #             writer.add_image(
-        #                 "automask_{}/{}".format(s, j),
-        #                 outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
@@ -832,3 +936,21 @@ class Trainer:
             self.model_optimizer.load_state_dict(optimizer_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
+    
+    def load_pseudo_model(self):
+        """Load model(s) from disk
+        """
+        self.opt.load_pseudo_model = os.path.expanduser(self.opt.load_pseudo_model)
+
+        assert os.path.isdir(self.opt.load_pseudo_model), \
+            "Cannot find folder {}".format(self.opt.load_pseudo_model)
+        print("loading model from folder {}".format(self.opt.load_pseudo_model))
+
+        for n in ["encoder", "depth"]:
+            print("Loading {} weights...".format(n))
+            path = os.path.join(self.opt.load_pseudo_model, "{}.pth".format(n))
+            model_dict = self.pseudo_models[n].state_dict()
+            pretrained_dict = torch.load(path)
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+            model_dict.update(pretrained_dict)
+            self.pseudo_models[n].load_state_dict(model_dict)
