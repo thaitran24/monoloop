@@ -44,8 +44,8 @@ class MonodepthOptions:
         self.parser.add_argument("--dataset",
                                  type=str,
                                  help="dataset to train on",
-                                 default="kitti",
-                                 choices=["kitti", "kitti_odom", "kitti_depth", "kitti_test"])
+                                 default="oxford",
+                                 choices=["kitti", "oxford", "kitti_odom", "kitti_depth", "kitti_test"])
         self.parser.add_argument("--png",
                                  help="if set, trains from raw KITTI png files (instead of jpgs)",
                                  action="store_true")
@@ -82,6 +82,9 @@ class MonodepthOptions:
                                  action="store_true")
         self.parser.add_argument("--pseudo_guide",
                                  help="if set, uses pseudo depth for day depth loss",
+                                 action="store_true")
+        self.parser.add_argument("--pseudo_pair",
+                                 help="if set, uses cycle gan paired image for pseudo label",
                                  action="store_true")
         self.parser.add_argument("--frame_ids",
                                  nargs="+",

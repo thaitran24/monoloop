@@ -10,6 +10,7 @@ import numpy as np
 import time
 
 import torch
+from torchvision import transforms
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -25,6 +26,7 @@ from layers import *
 import datasets
 import networks
 from IPython import embed
+from PIL import Image
 
 import cv2
 STEREO_SCALE_FACTOR = 5.4
@@ -158,7 +160,8 @@ class Trainer:
         print("Training is using:\n  ", self.device)
 
         # Data
-        datasets_dict = {"kitti": datasets.KITTIRAWDataset}
+        datasets_dict = {"oxford": datasets.OxfordRawDataset, 
+                         "oxford_pair": datasets.OxfordRawPairDataset}
         self.dataset = datasets_dict[self.opt.dataset]
 
         fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
@@ -172,19 +175,36 @@ class Trainer:
         num_train_samples = len(train_day_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
 
-        train_day_dataset = self.dataset(
-            self.opt.data_path, train_day_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
-        self.train_day_loader = DataLoader(
-            train_day_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
-        
-        train_night_dataset = self.dataset(
-            self.opt.data_path, train_night_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
-        self.train_night_loader = DataLoader(
-            train_night_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+        if not self.opt.pseudo_pair:
+            train_day_dataset = self.dataset(
+                self.opt.data_path, train_day_filenames, self.opt.height, self.opt.width,
+                self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+            self.train_day_loader = DataLoader(
+                train_day_dataset, self.opt.batch_size, True,
+                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            
+            train_night_dataset = self.dataset(
+                self.opt.data_path, train_night_filenames, self.opt.height, self.opt.width,
+                self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+            self.train_night_loader = DataLoader(
+                train_night_dataset, self.opt.batch_size, True,
+                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+
+        elif self.opt.pseudo_pair:
+            self.pair_dataset = datasets_dict["oxford_pair"]
+            train_day_dataset = self.pair_dataset(
+                self.opt.data_path, train_day_filenames, self.opt.height, self.opt.width,
+                self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+            self.train_day_loader = DataLoader(
+                train_day_dataset, self.opt.batch_size, True,
+                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            
+            train_night_dataset = self.pair_dataset(
+                self.opt.data_path, train_night_filenames, self.opt.height, self.opt.width,
+                self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+            self.train_night_loader = DataLoader(
+                train_night_dataset, self.opt.batch_size, True,
+                num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
 
         val_day_dataset = self.dataset(
             self.opt.data_path, val_day_filenames, self.opt.height, self.opt.width,
@@ -300,10 +320,11 @@ class Trainer:
             duration = time.time() - before_op_time
 
             # log less frequently after the first 2000 steps to save time & disk space
-            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 2000
-            late_phase = self.step % 2000 == 0
+            # early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 2000
+            # late_phase = self.step % 2000 == 0
 
-            if early_phase or late_phase:
+            # if early_phase or late_phase:
+            if batch_idx % 200 == 0:
                 self.log_time(batch_idx, duration, losses)
 
                 # if "depth_gt" in day_inputs:
@@ -314,8 +335,8 @@ class Trainer:
 
             self.step += 1
 
-        # self.evaluate(day=True)
-        # self.evaluate(day=False)
+        self.evaluate(day=True)
+        self.evaluate(day=False)
 
     def process_batch(self, day_inputs, night_inputs):
         """Pass a minibatch through the network and generate images and losses
@@ -333,15 +354,19 @@ class Trainer:
 
         if self.opt.load_pseudo_model:
             # Day disp pseudo label
-            pseudo_features = self.models["encoder"](day_inputs["color_aug", 0, 0])
-            pseudo_outputs = self.models["depth"](pseudo_features)
+            day_fuse_features = self.pseudo_models["encoder"](day_inputs["color_aug", 0, 0])
+            day_fuse_outputs = self.pseudo_models["depth"](day_fuse_features)
+        
+        if self.opt.pseudo_pair:
+            day_pseudo_features = self.pseudo_models["encoder"](night_inputs["color_f_aug", 0, 0])
+            day_pseudo_outputs = self.pseudo_models["depth"](day_pseudo_features)
 
         # Fuse disp with pseudo disp
         fuse_depth_disp = {}
+        alpha = 0.5
         if self.opt.load_pseudo_model:
-            alpha = 0.5
             for i in self.opt.scales:
-                fuse_depth_disp[("disp", i)] = alpha * pseudo_outputs[("disp", i)] + \
+                fuse_depth_disp[("disp", i)] = alpha * day_fuse_outputs[("disp", i)] + \
                     (1 - alpha) * day_depth_outputs_p1[("disp", i)].detach()  # Stop Gradient
 
         # 1.2. Inner Loop: Depth -> Day
@@ -355,9 +380,8 @@ class Trainer:
         night_depth_outputs_p1 = self.models["depth"](night_features_p1)
         fuse_depth_disp = {} 
         if self.opt.load_pseudo_model:
-            alpha = 0.5
             for i in self.opt.scales:
-                fuse_depth_disp[("disp", i)] = alpha * pseudo_outputs[("disp", i)] + \
+                fuse_depth_disp[("disp", i)] = alpha * day_fuse_outputs[("disp", i)] + \
                     (1 - alpha) * night_depth_outputs_p1[("disp", i)].detach()    # Stop Gradient
 
         # 1.5: Outer Loop: Depth -> Day
@@ -402,18 +426,25 @@ class Trainer:
         losses["p1/depth_sim"] = self.l1_loss(day_depth_outputs_p1[("disp", 0)].detach(),   # Stop gradient when update day depth
                                           night_depth_outputs_p1[("disp", 0)])
 
-        if self.opt.pseudo_guide:
-            losses["p1/depth_sim"] += self.l1_loss(pseudo_outputs[("disp", 0)], day_depth_outputs_p1[("disp", 0)])
-
-        if self.use_pose_net:
-            day_depth_outputs_p1.update(self.predict_poses(day_inputs, day_features_p1))
-        
+        day_depth_outputs_p1.update(self.predict_poses(day_inputs, day_features_p1))
         self.generate_images_pred(day_inputs, day_depth_outputs_p1)
         losses_depth_p1 = self.compute_losses(day_inputs, day_depth_outputs_p1)
-        
-
         losses["p1/depth"] = losses_depth_p1["loss"]
-        losses["p1/feat_sim"] = self.l1_loss(day_features_p1[3], night_features_p1[3])
+        
+        if self.opt.pseudo_pair:
+            losses["p1/depth_sim"] += self.l1_loss(day_fuse_outputs[("disp", 0)], day_depth_outputs_p1[("disp", 0)])
+            losses["p1/night_sim"] = self.l1_loss(day_inputs["color_f", 0, 0], night_outer_outputs_p1[("render", 0)])
+            self.transfer_inputs(day_inputs, night_outer_outputs_p1)
+
+            night_depth_outputs_p1.update(self.predict_poses(night_outer_outputs_p1, night_features_p1))
+            self.generate_images_pred(night_outer_outputs_p1, night_depth_outputs_p1)
+            losses_depth_p1 = self.compute_losses(night_outer_outputs_p1, night_depth_outputs_p1)
+            losses["p1/depth"] += losses_depth_p1["loss"]
+
+        losses["p1/feat_sim"] = 0
+        for i in self.opt.scales:
+            losses["p1/feat_sim"] += self.l1_loss(day_features_p1[i], night_features_p1[i])
+        losses["p1/feat_sim"] /= self.opt.num_scales
         losses["p1/percep"] = self.lpips(day_inputs["color_aug", 0, 0], night_outer_outputs_p1[("render", 0)])
         
         # Phase 1 adversarial
@@ -436,31 +467,56 @@ class Trainer:
         losses["p1/G"] *= lambda_adv
         
         losses["loss"] += losses["p1/inner_sim"] + losses["p1/outer_sim"] + losses["p1/depth_sim"] + \
-            losses["p1/depth"] + losses["p1/feat_sim"] + losses["p1/percep"] + losses["p1/G"]
+            losses["p1/depth"] + losses["p1/feat_sim"] + losses["p1/G"] + losses["p1/percep"]
+        
+        if self.opt.pseudo_pair:
+            losses["loss"] += losses["p1/night_sim"]
         
         # Phase 2 losses
         losses["p2/inner_sim"] = self.l1_loss(night_inner_outputs_p2[("render", 0)], night_inputs["color", 0, 0])
         losses["p2/outer_sim"] = self.l1_loss(night_outer_outputs_p2[("render", 0)], night_inputs["color", 0, 0])
         losses["p2/depth_sim"] = self.l1_loss(night_depth_outputs_p2[("disp", 0)], day_depth_outputs_p2[("disp", 0)])
 
-        if self.use_pose_net:
-            night_depth_outputs_p2.update(self.predict_poses(night_inputs, night_features_p2))
+        night_depth_outputs_p2.update(self.predict_poses(night_inputs, night_features_p2))
         self.generate_images_pred(night_inputs, night_depth_outputs_p2)
         losses_depth_p2 = self.compute_losses(night_inputs, night_depth_outputs_p2)
-
         losses["p2/depth"] = losses_depth_p2["loss"]
-        losses["p2/feat_sim"] = self.l1_loss(day_features_p2[3], night_features_p2[3])
+
+        if self.opt.pseudo_pair:
+            losses["p2/day_sim"] = self.l1_loss(night_inputs["color_f", 0, 0], day_outer_outputs_p2[("render", 0)])
+            self.transfer_inputs(night_inputs, day_outer_outputs_p2)
+            
+            day_depth_outputs_p2.update(self.predict_poses(day_outer_outputs_p2, day_features_p2))
+            self.generate_images_pred(day_outer_outputs_p2, day_depth_outputs_p2)
+            losses_depth_p2 = self.compute_losses(day_outer_outputs_p2, day_depth_outputs_p2)
+            losses["p2/depth"] += losses_depth_p2["loss"]
+
+        losses["p2/feat_sim"] = 0
+        for i in self.opt.scales:
+            losses["p2/feat_sim"] += self.l1_loss(day_features_p2[i], night_features_p2[i])
+        losses["p2/feat_sim"] /= self.num_scales
         losses["p2/percep"] = self.lpips(night_inputs["color_aug", 0, 0], day_outer_outputs_p2[("render", 0)])
+
+        if self.opt.pseudo_pair:
+            losses["p2/pseudo_pair"] = lambda_depth * self.l1_loss(night_depth_outputs_p2[("disp", 0)], day_pseudo_outputs[("disp", 0)])
 
         # Phase 2 adversarial
         day_pred = self.classifiers["day"](day_inputs["color", 0, 0])
         day_trans_pred = self.classifiers["day"](day_outer_outputs_p2[("render", 0)])
         losses["p2/G"] = self.mse(day_pred, source_label) + self.mse(day_trans_pred, target_label)
 
+        if self.opt.pseudo_pair:
+            day_pseudo_pred = self.classifiers["day"](night_inputs["color_f", 0, 0])
+            losses["p2/G"] += self.mse(day_pseudo_pred, source_label)
+
         day_pred = self.classifiers["day"](day_inputs["color", 0, 0].detach())
         day_trans_pred = self.classifiers["day"](day_outer_outputs_p2[("render", 0)].detach())
         losses["p2/D"] = self.mse(day_pred, target_label) + self.mse(day_trans_pred, source_label)
-                
+        
+        if self.opt.pseudo_pair:
+            day_pseudo_pred = self.classifiers["day"](night_inputs["color_f", 0, 0].detach())
+            losses["p2/D"] += self.mse(day_pseudo_pred, target_label)
+
         losses["p2/inner_sim"] *= lambda_inner_sim
         losses["p2/outer_sim"] *= lambda_outer_sim
         losses["p2/depth_sim"] *= lambda_depth_sim
@@ -468,12 +524,16 @@ class Trainer:
         losses["p2/feat_sim"] *= lambda_feat_sim
         losses["p2/percep"] *= lambda_percep
         losses["p2/G"] *= lambda_adv
-
+    
         losses["loss"] += losses["p2/inner_sim"] + losses["p2/outer_sim"] + losses["p2/depth_sim"] + \
-            losses["p2/depth"] + losses["p2/feat_sim"] + losses["p2/percep"] + losses["p2/G"]
+            losses["p2/depth"] + losses["p2/feat_sim"] + losses["p2/G"] + losses["p2/percep"]
+
+        if self.opt.pseudo_pair:
+            losses["loss"] += losses["p2/day_sim"]
+            losses["loss"] += losses["p2/pseudo_pair"]
 
         return losses
-
+    
 
     def predict_poses(self, inputs, features):
         """Predict poses between input frames for monocular sequences.
@@ -999,3 +1059,24 @@ class Trainer:
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)
             self.pseudo_models[n].load_state_dict(model_dict)
+    
+    def transfer_inputs(self, inputs, renders):
+        self.resize = {}
+
+        for i in self.opt.scales:
+            s = 2 ** i
+            self.resize[i] = transforms.Resize((self.opt.height // s, self.opt.width // s), \
+                                                interpolation=Image.ANTIALIAS)
+        for i in self.opt.scales:
+            renders[("K", i)] = inputs[("K", i)]
+            renders[("inv_K", i)] = inputs[("inv_K", i)]
+        
+        for i in self.opt.scales:
+            renders[("color", 0, i)] = self.resize[i](renders[("render", i)])
+            renders[("color_aug", 0, i)] = self.resize[i](renders[("render", i)])
+
+        for fr in [-1, 1]:
+            for i in self.opt.scales:
+                renders[("color", fr, i)] = inputs[("color_f", fr, i)]
+                renders[("color_aug", fr, i)] = inputs[("color_f_aug", fr, i)]
+
