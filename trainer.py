@@ -431,8 +431,10 @@ class Trainer:
         losses_depth_p1 = self.compute_losses(day_inputs, day_depth_outputs_p1)
         losses["p1/depth"] = losses_depth_p1["loss"]
         
-        if self.opt.pseudo_pair:
+        if self.opt.pseudo_guide:
             losses["p1/depth_sim"] += self.l1_loss(day_fuse_outputs[("disp", 0)], day_depth_outputs_p1[("disp", 0)])
+        
+        if self.opt.pseudo_pair:
             losses["p1/night_sim"] = self.l1_loss(day_inputs["color_f", 0, 0], night_outer_outputs_p1[("render", 0)])
             self.transfer_inputs(day_inputs, night_outer_outputs_p1)
 
@@ -444,7 +446,7 @@ class Trainer:
         losses["p1/feat_sim"] = 0
         for i in self.opt.scales:
             losses["p1/feat_sim"] += self.l1_loss(day_features_p1[i], night_features_p1[i])
-        losses["p1/feat_sim"] /= self.opt.num_scales
+        losses["p1/feat_sim"] /= self.num_scales
         losses["p1/percep"] = self.lpips(day_inputs["color_aug", 0, 0], night_outer_outputs_p1[("render", 0)])
         
         # Phase 1 adversarial
