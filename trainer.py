@@ -417,7 +417,7 @@ class Trainer:
         lambda_depth_sim = 1
         lambda_feat_sim = 0.1
         lambda_percep = 0.25
-        lambda_adv = 0.1
+        lambda_adv = 0.05
         lambda_depth = 1.25
 
         # Phase 1 losses
@@ -447,7 +447,7 @@ class Trainer:
         for i in self.opt.scales:
             losses["p1/feat_sim"] += self.l1_loss(day_features_p1[i], night_features_p1[i])
         losses["p1/feat_sim"] /= self.num_scales
-        losses["p1/percep"] = self.lpips(day_inputs["color_aug", 0, 0], night_outer_outputs_p1[("render", 0)])
+
         
         # Phase 1 adversarial
         night_pred = self.classifiers["night"](night_inputs["color", 0, 0])
@@ -465,12 +465,16 @@ class Trainer:
         losses["p1/depth_sim"] *= lambda_depth_sim
         losses["p1/depth"] *= lambda_depth
         losses["p1/feat_sim"] *= lambda_feat_sim
-        losses["p1/percep"] *= lambda_percep
         losses["p1/G"] *= lambda_adv
         
         losses["loss"] += losses["p1/inner_sim"] + losses["p1/outer_sim"] + losses["p1/depth_sim"] + \
-            losses["p1/depth"] + losses["p1/feat_sim"] + losses["p1/G"] + losses["p1/percep"]
+            losses["p1/depth"] + losses["p1/feat_sim"] + losses["p1/G"]
         
+        if not self.opt.no_percep:
+            losses["p1/percep"] = self.lpips(day_inputs["color_aug", 0, 0], night_outer_outputs_p1[("render", 0)])
+            losses["p1/percep"] *= lambda_percep
+            losses["loss"] += losses["p1/percep"]
+
         if self.opt.pseudo_pair:
             losses["loss"] += losses["p1/night_sim"]
         
@@ -497,7 +501,6 @@ class Trainer:
         for i in self.opt.scales:
             losses["p2/feat_sim"] += self.l1_loss(day_features_p2[i], night_features_p2[i])
         losses["p2/feat_sim"] /= self.num_scales
-        losses["p2/percep"] = self.lpips(night_inputs["color_aug", 0, 0], day_outer_outputs_p2[("render", 0)])
 
         if self.opt.pseudo_pair:
             losses["p2/pseudo_pair"] = lambda_depth * self.l1_loss(night_depth_outputs_p2[("disp", 0)], day_pseudo_outputs[("disp", 0)])
@@ -524,11 +527,15 @@ class Trainer:
         losses["p2/depth_sim"] *= lambda_depth_sim
         losses["p2/depth"] *= lambda_depth
         losses["p2/feat_sim"] *= lambda_feat_sim
-        losses["p2/percep"] *= lambda_percep
         losses["p2/G"] *= lambda_adv
     
         losses["loss"] += losses["p2/inner_sim"] + losses["p2/outer_sim"] + losses["p2/depth_sim"] + \
-            losses["p2/depth"] + losses["p2/feat_sim"] + losses["p2/G"] + losses["p2/percep"]
+            losses["p2/depth"] + losses["p2/feat_sim"] + losses["p2/G"]
+
+        if not self.opt.no_percep:
+            losses["p2/percep"] = self.lpips(night_inputs["color_aug", 0, 0], day_outer_outputs_p2[("render", 0)])
+            losses["p2/percep"] *= lambda_percep
+            losses["loss"] += losses["p2/percep"]
 
         if self.opt.pseudo_pair:
             losses["loss"] += losses["p2/day_sim"]
@@ -963,21 +970,38 @@ class Trainer:
         time_sofar = time.time() - self.start_time
         training_time_left = (
             self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
-        print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
-            " | loss: {:.5f} | loss day: {:.5f} | loss night: {:.5f}" + \
-                " | loss D: {:.5f} | loss G: {:.5f} | loss inner: {:.5f}" + \
-                    " | loss outer: {:.5f} | loss depth: {:.5f} | loss feat: {:.5f}" + \
-                        " | loss percep: {:.5f} |  time elapsed: {} | time left: {}"
-        print(print_string.format(self.epoch, batch_idx, samples_per_sec, losses["loss"].cpu().data, \
-                                  losses["p1/depth"].cpu().data, losses["p2/depth"].cpu().data, \
-                                  losses["p1/D"].cpu().data + losses["p2/D"].cpu().data, \
-                                  losses["p1/G"].cpu().data + losses["p2/G"].cpu().data, \
-                                  losses["p1/inner_sim"].cpu().data + losses["p2/inner_sim"].cpu().data, \
-                                  losses["p1/outer_sim"].cpu().data + losses["p2/outer_sim"].cpu().data, \
-                                  losses["p1/depth_sim"].cpu().data + losses["p2/depth_sim"].cpu().data, \
-                                  losses["p1/feat_sim"].cpu().data + losses["p2/feat_sim"].cpu().data, \
-                                  losses["p1/percep"].cpu().data + losses["p2/percep"].cpu().data, \
-                                  sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
+        if not self.opt.no_percep:
+            print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
+                " | loss: {:.5f} | loss day: {:.5f} | loss night: {:.5f}" + \
+                    " | loss D: {:.5f} | loss G: {:.5f} | loss inner: {:.5f}" + \
+                        " | loss outer: {:.5f} | loss depth: {:.5f} | loss feat: {:.5f}" + \
+                            " | loss percep: {:.5f} |  time elapsed: {} | time left: {}"
+            print(print_string.format(self.epoch, batch_idx, samples_per_sec, losses["loss"].cpu().data, \
+                                    losses["p1/depth"].cpu().data, losses["p2/depth"].cpu().data, \
+                                    losses["p1/D"].cpu().data + losses["p2/D"].cpu().data, \
+                                    losses["p1/G"].cpu().data + losses["p2/G"].cpu().data, \
+                                    losses["p1/inner_sim"].cpu().data + losses["p2/inner_sim"].cpu().data, \
+                                    losses["p1/outer_sim"].cpu().data + losses["p2/outer_sim"].cpu().data, \
+                                    losses["p1/depth_sim"].cpu().data + losses["p2/depth_sim"].cpu().data, \
+                                    losses["p1/feat_sim"].cpu().data + losses["p2/feat_sim"].cpu().data, \
+                                    losses["p1/percep"].cpu().data + losses["p2/percep"].cpu().data, \
+                                    sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
+        else:
+            print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
+                " | loss: {:.5f} | loss day: {:.5f} | loss night: {:.5f}" + \
+                    " | loss D: {:.5f} | loss G: {:.5f} | loss inner: {:.5f}" + \
+                        " | loss outer: {:.5f} | loss depth: {:.5f} | loss feat: {:.5f}" + \
+                            " | time elapsed: {} | time left: {}"
+            print(print_string.format(self.epoch, batch_idx, samples_per_sec, losses["loss"].cpu().data, \
+                                losses["p1/depth"].cpu().data, losses["p2/depth"].cpu().data, \
+                                losses["p1/D"].cpu().data + losses["p2/D"].cpu().data, \
+                                losses["p1/G"].cpu().data + losses["p2/G"].cpu().data, \
+                                losses["p1/inner_sim"].cpu().data + losses["p2/inner_sim"].cpu().data, \
+                                losses["p1/outer_sim"].cpu().data + losses["p2/outer_sim"].cpu().data, \
+                                losses["p1/depth_sim"].cpu().data + losses["p2/depth_sim"].cpu().data, \
+                                losses["p1/feat_sim"].cpu().data + losses["p2/feat_sim"].cpu().data, \
+                                sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
+            
 
     def log(self, mode, losses):
         """Write an event to the tensorboard events file
@@ -1064,18 +1088,26 @@ class Trainer:
     
     def transfer_inputs(self, inputs, renders):
         self.resize = {}
+        pil_to_tensor = transforms.Compose([
+            transforms.PILToTensor()
+        ])
 
-        for i in self.opt.scales:
-            s = 2 ** i
-            self.resize[i] = transforms.Resize((self.opt.height // s, self.opt.width // s), \
-                                                interpolation=Image.ANTIALIAS)
         for i in self.opt.scales:
             renders[("K", i)] = inputs[("K", i)]
             renders[("inv_K", i)] = inputs[("inv_K", i)]
         
         for i in self.opt.scales:
-            renders[("color", 0, i)] = self.resize[i](renders[("render", i)])
-            renders[("color_aug", 0, i)] = self.resize[i](renders[("render", i)])
+            s = 2 ** i
+            self.resize[i] = transforms.Resize((self.opt.height // s, self.opt.width // s), \
+                                                interpolation=Image.ANTIALIAS)
+            shape = renders[("render", 0)].shape
+            renders[("color", 0, i)] = torch.zeros([shape[0], shape[1], self.opt.height // s, self.opt.width // s]).to(self.device)
+            renders[("color_aug", 0, i)] = torch.zeros([shape[0], shape[1], self.opt.height // s, self.opt.width // s]).to(self.device)
+            for b in range(shape[0]):
+                img = transforms.functional.to_pil_image(renders[("render", 0)][b])
+                img = self.resize[i](img)
+                renders[("color", 0, i)][b] = pil_to_tensor(img).to(self.device) 
+                renders[("color_aug", 0, i)][b] = pil_to_tensor(img).to(self.device)
 
         for fr in [-1, 1]:
             for i in self.opt.scales:

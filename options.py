@@ -86,6 +86,9 @@ class MonodepthOptions:
         self.parser.add_argument("--pseudo_pair",
                                  help="if set, uses cycle gan paired image for pseudo label",
                                  action="store_true")
+        self.parser.add_argument("--no_percep",
+                                 help="if set, don't use perceptual loss",
+                                 action="store_true")
         self.parser.add_argument("--frame_ids",
                                  nargs="+",
                                  type=int,
