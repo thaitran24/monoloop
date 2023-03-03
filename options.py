@@ -45,9 +45,9 @@ class MonodepthOptions:
                                  type=str,
                                  help="dataset to train on",
                                  default="oxford",
-                                 choices=["kitti", "oxford", "kitti_odom", "kitti_depth", "kitti_test"])
+                                 choices=["oxford"])
         self.parser.add_argument("--png",
-                                 help="if set, trains from raw KITTI png files (instead of jpgs)",
+                                 help="if set, trains from raw Oxford png files (instead of jpgs)",
                                  action="store_true")
         self.parser.add_argument("--height",
                                  type=int,
@@ -74,9 +74,16 @@ class MonodepthOptions:
                                  type=float,
                                  help="maximum depth",
                                  default=100.0)
-        self.parser.add_argument("--shared_classifier",
-                                 help="if set, use only a classifier for day/night disc",
-                                 action="store_true")
+        self.parser.add_argument("--frame_ids",
+                                 nargs="+",
+                                 type=int,
+                                 help="frames to load",
+                                 default=[0, -1, 1])
+        self.parser.add_argument("--phase",
+                                 nargs="+",
+                                 type=int,
+                                 help="training phase: first phase is day to night mapping, second is night to day",
+                                 default=[1, 2]) 
         self.parser.add_argument("--use_stereo",
                                  help="if set, uses stereo pair for training",
                                  action="store_true")
@@ -86,14 +93,21 @@ class MonodepthOptions:
         self.parser.add_argument("--pseudo_pair",
                                  help="if set, uses cycle gan paired image for pseudo label",
                                  action="store_true")
+        self.parser.add_argument("--only_im2im",
+                                 help="if set, only train image to image task",
+                                 action="store_true")
+        self.parser.add_argument("--fuse_disp",
+                                 help="if set, fuse disparity with image decoder",
+                                 action="store_true")
+        self.parser.add_argument("--freeze_day_dec",
+                                 help="if set, freeze day image decoder",
+                                 action="store_true")
+        self.parser.add_argument("--freeze_night_dec",
+                                 help="if set, freeze night image decoder",
+                                 action="store_true")
         self.parser.add_argument("--no_percep",
                                  help="if set, don't use perceptual loss",
                                  action="store_true")
-        self.parser.add_argument("--frame_ids",
-                                 nargs="+",
-                                 type=int,
-                                 help="frames to load",
-                                 default=[0, -1, 1])
 
         # OPTIMIZATION options
         self.parser.add_argument("--batch_size",
@@ -161,6 +175,12 @@ class MonodepthOptions:
         self.parser.add_argument("--load_pseudo_model",
                                  type=str,
                                  help="name of pseudo model to load")
+        self.parser.add_argument("--load_day_dec",
+                                 type=str,
+                                 help="name of day decoder to load")
+        self.parser.add_argument("--load_night_dec",
+                                 type=str,
+                                 help="name of night decoder to load")
         self.parser.add_argument("--models_to_load",
                                  nargs="+",
                                  type=str,
