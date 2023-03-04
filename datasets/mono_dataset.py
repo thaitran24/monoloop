@@ -46,6 +46,7 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
+                 load_pseudo=False,
                  img_ext='.jpg'):
         super(MonoDataset, self).__init__()
 
@@ -55,7 +56,7 @@ class MonoDataset(data.Dataset):
         self.width = width
         self.num_scales = num_scales
         self.interp = Image.ANTIALIAS
-
+        self.load_pseudo = load_pseudo
         self.frame_idxs = frame_idxs
 
         self.is_train = is_train
@@ -190,6 +191,14 @@ class MonoDataset(data.Dataset):
             depth_gt = self.get_depth(folder, frame_index, side, do_flip)
             inputs["depth_gt"] = np.expand_dims(depth_gt, 0)
             inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
+
+        if self.load_pseudo:
+            folder_pseudo = folder + '_disp'
+            for i in self.frame_idxs:
+                f_str = "{:010d}{}".format(frame_index, '.npy')
+                image_path = os.path.join(
+                    self.data_path, folder_pseudo, f_str)
+                inputs[("disp", i)] = torch.from_numpy(np.load(image_path))
 
         if "s" in self.frame_idxs:
             stereo_T = np.eye(4, dtype=np.float32)
