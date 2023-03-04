@@ -105,6 +105,9 @@ class MonodepthOptions:
         self.parser.add_argument("--freeze_night_dec",
                                  help="if set, freeze night image decoder",
                                  action="store_true")
+        self.parser.add_argument("--freeze_depth_dec",
+                                 help="if set, freeze depth decoder",
+                                 action="store_true")
         self.parser.add_argument("--no_percep",
                                  help="if set, don't use perceptual loss",
                                  action="store_true")

@@ -74,6 +74,9 @@ class Trainer:
             self.models["depth"].to(self.device)
             self.parameters_to_train += list(self.models["depth"].parameters())
 
+            if self.opt.freeze_depth_dec:
+                self.models["depth"].eval()
+                
         if self.opt.load_pseudo_model and not self.opt.only_im2im:
             self.pseudo_models = {}
             # Pseudo Model Encoder and Decoder
