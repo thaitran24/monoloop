@@ -61,6 +61,7 @@ def evaluate(opt):
     """
     MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
+    EVAL_DEPTH = 40
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"
@@ -74,7 +75,7 @@ def evaluate(opt):
 
         print("-> Loading weights from {}".format(opt.load_weights_folder))
 
-        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
+        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "val_files.txt"))
         encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
@@ -82,7 +83,7 @@ def evaluate(opt):
 
         dataset = datasets.OxfordRawDataset(opt.data_path, filenames,
                                            encoder_dict['height'], encoder_dict['width'],
-                                           [0], 4, is_train=False)
+                                           [0], 4, is_train=False, img_ext='.png')
         dataloader = DataLoader(dataset, 16, shuffle=False, num_workers=opt.num_workers,
                                 pin_memory=True, drop_last=False)
 
@@ -99,7 +100,7 @@ def evaluate(opt):
         depth_decoder.eval()
 
         pred_disps = []
-
+        gt = []
         print("-> Computing predictions with size {}x{}".format(
             encoder_dict['width'], encoder_dict['height']))
 
@@ -121,8 +122,12 @@ def evaluate(opt):
                     pred_disp = batch_post_process_disparity(pred_disp[:N], pred_disp[N:, :, ::-1])
 
                 pred_disps.append(pred_disp)
+                gt.append(np.squeeze(data['depth_gt'].cpu().numpy()))
 
         pred_disps = np.concatenate(pred_disps)
+        if gt[-1].ndim==2:
+            gt[-1] = gt[-1][np.newaxis,:]
+        gt = np.concatenate(gt)
 
     else:
         # Load predictions from file
@@ -152,7 +157,7 @@ def evaluate(opt):
             os.makedirs(save_dir)
 
         for idx in range(len(pred_disps)):
-            disp_resized = cv2.resize(pred_disps[idx], (1216, 352))
+            disp_resized = cv2.resize(pred_disps[idx], (1280, 640))
             depth = STEREO_SCALE_FACTOR / disp_resized
             depth = np.clip(depth, 0, 80)
             depth = np.uint16(depth * 256)
@@ -162,8 +167,8 @@ def evaluate(opt):
         print("-> No ground truth is available for the KITTI benchmark, so not evaluating. Done.")
         quit()
 
-    gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
-    gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
+    # gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
+    # gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
 
     print("-> Evaluating")
 
@@ -180,7 +185,7 @@ def evaluate(opt):
 
     for i in range(pred_disps.shape[0]):
 
-        gt_depth = gt_depths[i]
+        gt_depth = gt[i]
         gt_height, gt_width = gt_depth.shape[:2]
 
         pred_disp = pred_disps[i]
@@ -210,6 +215,10 @@ def evaluate(opt):
 
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
+        
+        mask2 = gt_depth <= EVAL_DEPTH
+        pred_depth = pred_depth[mask2]
+        gt_depth = gt_depth[mask2]
 
         errors.append(compute_errors(gt_depth, pred_depth))
 

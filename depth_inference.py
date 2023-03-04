@@ -1,9 +1,3 @@
-# Copyright Niantic 2019. Patent Pending. All rights reserved.
-#
-# This software is licensed under the terms of the Monodepth2 licence
-# which allows for non-commercial use only, the full terms of which are made
-# available in the LICENSE file.
-
 from __future__ import absolute_import, division, print_function
 
 import os
@@ -21,7 +15,6 @@ from torchvision import transforms, datasets
 import networks
 from layers import disp_to_depth
 from utils import download_model_if_doesnt_exist
-from evaluate_depth import STEREO_SCALE_FACTOR
 
 
 def parse_args():
@@ -29,27 +22,17 @@ def parse_args():
         description='Simple testing funtion for Monodepthv2 models.')
 
     parser.add_argument('--image_path', type=str,
-                        help='path to a test image or folder of images', required=True)
+                        default='0000029664.png',
+                        help='path to a test image or folder of images')
+    parser.add_argument('--save_dir', type=str,
+                        help='path to a test image or folder of images')
     parser.add_argument('--model_name', type=str,
-                        help='name of a pretrained model to use',
-                        choices=[
-                            "mono_640x192",
-                            "stereo_640x192",
-                            "mono+stereo_640x192",
-                            "mono_no_pt_640x192",
-                            "stereo_no_pt_640x192",
-                            "mono+stereo_no_pt_640x192",
-                            "mono_1024x320",
-                            "stereo_1024x320",
-                            "mono+stereo_1024x320"])
+                        default='pretrained_model/',
+                        help='name of a pretrained model to use',)
     parser.add_argument('--ext', type=str,
                         help='image extension to search for in folder', default="jpg")
     parser.add_argument("--no_cuda",
                         help='if set, disables CUDA',
-                        action='store_true')
-    parser.add_argument("--pred_metric_depth",
-                        help='if set, predicts metric depth instead of disparity. (This only '
-                             'makes sense for stereo-trained KITTI models).',
                         action='store_true')
 
     return parser.parse_args()
@@ -66,12 +49,9 @@ def test_simple(args):
     else:
         device = torch.device("cpu")
 
-    if args.pred_metric_depth and "stereo" not in args.model_name:
-        print("Warning: The --pred_metric_depth flag only makes sense for stereo-trained KITTI "
-              "models. For mono-trained models, output depths will not in metric space.")
-
-    download_model_if_doesnt_exist(args.model_name)
-    model_path = os.path.join("models", args.model_name)
+    # download_model_if_doesnt_exist(args.model_name)
+    # model_path = os.path.join("models", args.model_name)
+    model_path = args.model_name
     print("-> Loading model from ", model_path)
     encoder_path = os.path.join(model_path, "encoder.pth")
     depth_decoder_path = os.path.join(model_path, "depth.pth")
@@ -123,6 +103,7 @@ def test_simple(args):
 
             # Load image and preprocess
             input_image = pil.open(image_path).convert('RGB')
+            #input_image = input_image.crop((0, 160, 1280, 960 - 160))
             original_width, original_height = input_image.size
             input_image = input_image.resize((feed_width, feed_height), pil.LANCZOS)
             input_image = transforms.ToTensor()(input_image).unsqueeze(0)
@@ -138,14 +119,6 @@ def test_simple(args):
 
             # Saving numpy file
             output_name = os.path.splitext(os.path.basename(image_path))[0]
-            scaled_disp, depth = disp_to_depth(disp, 0.1, 100)
-            if args.pred_metric_depth:
-                name_dest_npy = os.path.join(output_directory, "{}_depth.npy".format(output_name))
-                metric_depth = STEREO_SCALE_FACTOR * depth.cpu().numpy()
-                np.save(name_dest_npy, metric_depth)
-            else:
-                name_dest_npy = os.path.join(output_directory, "{}_disp.npy".format(output_name))
-                np.save(name_dest_npy, scaled_disp.cpu().numpy())
 
             # Saving colormapped depth image
             disp_resized_np = disp_resized.squeeze().cpu().numpy()
@@ -155,13 +128,11 @@ def test_simple(args):
             colormapped_im = (mapper.to_rgba(disp_resized_np)[:, :, :3] * 255).astype(np.uint8)
             im = pil.fromarray(colormapped_im)
 
-            name_dest_im = os.path.join(output_directory, "{}_disp.jpeg".format(output_name))
+            name_dest_im = os.path.join(args.save_dir, "{}.png".format(output_name))
             im.save(name_dest_im)
 
-            print("   Processed {:d} of {:d} images - saved predictions to:".format(
-                idx + 1, len(paths)))
-            print("   - {}".format(name_dest_im))
-            print("   - {}".format(name_dest_npy))
+            print("   Processed {:d} of {:d} images - saved prediction to {}".format(
+                idx + 1, len(paths), name_dest_im))
 
     print('-> Done!')
 
