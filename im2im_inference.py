@@ -37,6 +37,9 @@ def parse_args():
     parser.add_argument("--night2day",
                         help='if set, transform day to night',
                         action='store_true')
+    parser.add_argument("--only_im2im",
+                        help='if set, transform day to night',
+                        action='store_true')
     parser.add_argument("--no_cuda",
                         help='if set, disables CUDA',
                         action='store_true')
@@ -60,7 +63,6 @@ def test_simple(args):
     model_path = args.model_name
     print("-> Loading model from ", model_path)
     encoder_path = os.path.join(model_path, "encoder.pth")
-    depth_decoder_path = os.path.join(model_path, "depth.pth")
     day_decoder_path = os.path.join(model_path, "day_dec.pth")
     night_decoder_path = os.path.join(model_path, "night_dec.pth")
 
@@ -78,14 +80,16 @@ def test_simple(args):
     encoder.eval()
 
     print("   Loading pretrained decoder")
-    depth_decoder = networks.DepthDecoder(
-        num_ch_enc=encoder.num_ch_enc, scales=range(4))
+    if not args.only_im2im:
+        depth_decoder_path = os.path.join(model_path, "depth.pth")
+        depth_decoder = networks.DepthDecoder(
+            num_ch_enc=encoder.num_ch_enc, scales=range(4))
 
-    loaded_dict = torch.load(depth_decoder_path, map_location=device)
-    depth_decoder.load_state_dict(loaded_dict)
+        loaded_dict = torch.load(depth_decoder_path, map_location=device)
+        depth_decoder.load_state_dict(loaded_dict)
 
-    depth_decoder.to(device)
-    depth_decoder.eval()
+        depth_decoder.to(device)
+        depth_decoder.eval()
 
     day_decoder = networks.LoopDecoder(
         num_ch_enc=encoder.num_ch_enc, scales=range(4))
@@ -136,8 +140,11 @@ def test_simple(args):
             # PREDICTION
             input_image = input_image.to(device)
             features = encoder(input_image)
-            outputs = depth_decoder(features)
-            
+            if not args.only_im2im:
+                outputs = depth_decoder(features)
+            else:
+                outputs = None
+
             if args.day2night:
                 results = night_decoder(features, outputs)
             

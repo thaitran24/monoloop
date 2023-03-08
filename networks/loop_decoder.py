@@ -66,3 +66,7 @@ class LoopDecoder(nn.Module):
                 self.outputs[("render", i)] = self.sigmoid(self.convs[("dispconv", i)](x))
 
         return self.outputs
+
+
+class CycleGANDecoder(nn.Module):
+    pass

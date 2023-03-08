@@ -377,7 +377,7 @@ class Trainer:
         lambda_depth_sim = 1
         lambda_feat_sim = 0.1
         lambda_percep = 0.25
-        lambda_adv = 0.05
+        lambda_adv = 0.1
         lambda_depth = 1.25
 
         if DAY_PHASE in self.opt.phase:
