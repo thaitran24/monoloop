@@ -84,6 +84,9 @@ class MonodepthOptions:
                                  type=int,
                                  help="training phase: first phase is day to night mapping, second is night to day",
                                  default=[1, 2]) 
+        self.parser.add_argument("--use_cyclegan_dec",
+                                 help="if set, uses cycle gan decoder for im2im task",
+                                 action="store_true")
         self.parser.add_argument("--use_stereo",
                                  help="if set, uses stereo pair for training",
                                  action="store_true")

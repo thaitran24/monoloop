@@ -93,14 +93,23 @@ class Trainer:
             for m in self.pseudo_models.values():
                 m.eval()
 
+        loop_decoders = {
+            "Interpolation": networks.LoopDecoder,
+            "CycleGAN": networks.CycleGANDecoder
+        }
+        if self.opt.use_cyclegan_dec:
+            loop_decoder = loop_decoders.get("CycleGAN")
+        else:
+            loop_decoder = loop_decoders.get("Interpolation")
+
         # Depth to day decoder
-        self.models["day_dec"] = networks.LoopDecoder(
+        self.models["day_dec"] = loop_decoder(
             self.models["encoder"].num_ch_enc, self.opt.scales)
         self.models["day_dec"].to(self.device)
         self.parameters_to_train += list(self.models["day_dec"].parameters())
         
         # Depth to night decoder
-        self.models["night_dec"] = networks.LoopDecoder(
+        self.models["night_dec"] = loop_decoder(
             self.models["encoder"].num_ch_enc, self.opt.scales)
         self.models["night_dec"].to(self.device)
         self.parameters_to_train += list(self.models["night_dec"].parameters())
@@ -190,10 +199,9 @@ class Trainer:
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
 
         if not self.opt.pseudo_pair:
-            load_pseudo = True if self.opt.pseudo_depth else False
             train_day_dataset = self.dataset(
                 self.opt.data_path, train_day_filenames, self.opt.height, self.opt.width,
-                self.opt.frame_ids, 4, is_train=True, load_pseudo=load_pseudo, img_ext=img_ext)
+                self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
             self.train_day_loader = DataLoader(
                 train_day_dataset, self.opt.batch_size, True,
                 num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
@@ -207,10 +215,9 @@ class Trainer:
 
         elif self.opt.pseudo_pair:
             self.pair_dataset = datasets_dict["oxford_pair"]
-            load_pseudo = True if self.opt.pseudo_depth else False
             train_day_dataset = self.pair_dataset(
                 self.opt.data_path, train_day_filenames, self.opt.height, self.opt.width,
-                self.opt.frame_ids, 4, is_train=True, load_pseudo=load_pseudo, img_ext=img_ext)
+                self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
             self.train_day_loader = DataLoader(
                 train_day_dataset, self.opt.batch_size, True,
                 num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
