@@ -79,13 +79,10 @@ class CycleGANDecoder(nn.Module):
         self.scales = scales
 
         self.convs = OrderedDict()
-        self.norms = OrderedDict()
         self.relu = nn.ReLU(True)
         self.reflection = nn.ReflectionPad2d(3)
         self.conv = nn.Conv2d(64, 3, kernel_size=7, padding=0)
 
-        print("enc: ", self.num_ch_enc)
-        print("dec: ", self.num_ch_dec)
         for i in range(4, -1, -1):
             num_ch_in = self.num_ch_enc[i]
             if i > 0:
@@ -97,7 +94,7 @@ class CycleGANDecoder(nn.Module):
             self.convs[("upconv", i, 0)] = nn.ConvTranspose2d(num_ch_in, num_ch_out,
                                          kernel_size=3, stride=2, padding=1, 
                                          output_padding=1, bias=use_bias).to(device)
-            self.norms[("norm", i)] = nn.InstanceNorm2d(num_ch_out).to(device)
+            self.convs[("norm", i)] = nn.InstanceNorm2d(num_ch_out).to(device)
 
             num_ch_in = self.num_ch_dec[i]
             if i > 0:
@@ -107,6 +104,8 @@ class CycleGANDecoder(nn.Module):
                 num_ch_out = self.num_ch_dec[i]
             self.convs[("upconv", i, 1)] = nn.Conv2d(num_ch_in, num_ch_out,
                                          kernel_size=3, padding=1, bias=use_bias).to(device)
+
+        self.decoder = nn.ModuleList(list(self.convs.values()))
 
     def forward(self, input_features, disp_maps=None):
         self.outputs = {}
@@ -121,7 +120,7 @@ class CycleGANDecoder(nn.Module):
                 if disp_maps:
                     disp = disp_maps[("disp", i)].expand(-1, disp_maps[("disp", i)].shape[1], -1, -1)
                     x = torch.mul(x, disp)
-                x = self.norms[("norm", i)](x)
+                x = self.convs[("norm", i)](x)
                 x = self.relu(x)
                 if i == 0:
                     x = nn.Tanh()(x)
